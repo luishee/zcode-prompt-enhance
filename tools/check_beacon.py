@@ -18,30 +18,20 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from zce_common import force_utf8  # noqa: E402
+
 # 信标由插件（MCP server）写入 %LOCALAPPDATA%\zcode-prompt-enhance\beacon.log。
-# 旧位置 logs/beacon.log 是已退役的 Python 服务写的，只作历史兜底。
-# 注意：不能写成「存在才用主路径，否则退回旧路径」——那样在两者都不存在时会报出旧路径，
-# 让人误以为在看插件日志（实际排查时被这个坑过一次）。
+# 已退役的 Python 服务曾写在仓库 logs/ 下；那条回退分支已删除——它在两个位置都不存在时
+# 会报出旧路径，让人误以为在看插件日志（实际排查时被这个坑过一次）。
 _PRIMARY_LOG = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "zcode-prompt-enhance" / "beacon.log"
-_LEGACY_LOG = Path(__file__).resolve().parent.parent / "logs" / "beacon.log"
 
 
 def resolve_log() -> tuple[Path, str]:
     """返回 (要读的路径, 来源说明)。"""
     if _PRIMARY_LOG.exists():
         return _PRIMARY_LOG, "插件（当前实现）"
-    if _LEGACY_LOG.exists():
-        return _LEGACY_LOG, "旧 Python 服务遗留"
     return _PRIMARY_LOG, "期望位置，尚不存在"
-
-
-def _force_utf8() -> None:
-    """Windows 控制台默认 GBK，中文信标解读会乱码；统一按 UTF-8 输出。"""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")
-        except (AttributeError, ValueError, OSError):
-            pass
 
 
 def read_events() -> list[dict]:
@@ -67,7 +57,7 @@ def read_events() -> list[dict]:
 
 
 def main() -> int:
-    _force_utf8()
+    force_utf8()
     parser = argparse.ArgumentParser()
     parser.add_argument("--wait", type=float, default=0, help="等待日志出现的秒数")
     args = parser.parse_args()
@@ -89,40 +79,55 @@ def main() -> int:
         return 1
 
     print(f"收到 {len(events)} 条信标（来源：{source} · {log_path}）：")
-    for ev in events[:40]:
+    # 打印"最后 40 条"而不是"最早 40 条"：日志到 5MB 上限后最早的那批是几天前的，
+    # 而下面要判断的是本次启动，打印旧会话内容会跟结论打架（实测很容易看串）。
+    for ev in events[-40:]:
         stage = ev.get("stage")
-        detail = {k: v for k, v in ev.items() if k not in ("stage", "ts", "url")}
+        detail = {k: v for k, v in ev.items() if k not in ("stage", "ts", "clientTs", "url", "session")}
         print(f"  - {stage}  {json.dumps(detail, ensure_ascii=False)}")
 
-    stages = {ev.get("stage") for ev in events}
+    # 只认「本次启动」的事件：上次运行成功过的 attached 不能证明这次按钮挂上了，
+    # 而「按钮没出现」正是这个工具唯一要回答的问题。
+    # 会话边界优先用注入脚本生成的 session（每次 boot 一个），因为 url 在多次启动之间
+    # 是稳定的，按 url 划分会把上一次的 attached 也算进来（会误报"✓ 已挂上"）。
+    # 老版本注入脚本没有 session 字段，仍退回按 url 划分。
+    last_session = next((ev.get("session") for ev in reversed(events) if ev.get("session")), "")
+    if last_session:
+        recent = [ev for ev in events if ev.get("session") == last_session]
+        print(f"（只统计本次启动：session={last_session}，{len(recent)} 条）")
+    else:
+        last_url = next((ev.get("url") for ev in reversed(events) if ev.get("url")), "")
+        recent = [ev for ev in events if ev.get("url") == last_url] if last_url else events
+        print("（信标里没有 session 字段：注入脚本是旧版本，按 url 划分会话）")
+    stages = {ev.get("stage") for ev in recent}
     print()
 
     # 写回结果单独说清楚：这是「增强成功但回填失败」这类问题的唯一线索
-    for stage, label in (("write-ok", "写回成功"), ("write-failed", "写回失败")):
-        for ev in events:
-            if ev.get("stage") != stage:
-                continue
-            if stage == "write-ok":
-                print(f"✓ 最近一次写回成功，走的策略：{ev.get('strategy')}"
-                      f"（找到官方 API={ev.get('hasApi')}）")
-            else:
-                print(f"✗ 最近一次写回失败：已尝试 {ev.get('tried')}；"
-                      f"找到官方 API={ev.get('hasApi')}")
-                print(f"  期望长度 {ev.get('wantLen')} / 实得 {ev.get('gotLen')}")
-                print(f"  期望开头：{str(ev.get('wantHead'))[:50]}")
-                print(f"  实得开头：{str(ev.get('gotHead'))[:50]}")
-                if not ev.get("hasApi"):
-                    print("  → 没找到官方输入 API：说明编辑器组件结构变了，需要更新 findEditorApi")
-            break
+    last_write = next(
+        (ev for ev in reversed(recent) if ev.get("stage") in ("write-ok", "write-failed")),
+        None,
+    )
+    if last_write:
+        if last_write.get("stage") == "write-ok":
+            print(f"✓ 最近一次写回成功，走的策略：{last_write.get('strategy')}"
+                  f"（找到官方 API={last_write.get('hasApi')}）")
+        else:
+            print(f"✗ 最近一次写回失败：已尝试 {last_write.get('tried')}；"
+                  f"找到官方 API={last_write.get('hasApi')}")
+            print(f"  期望长度 {last_write.get('wantLen')} / 实得 {last_write.get('gotLen')}")
+            print(f"  期望开头：{str(last_write.get('wantHead'))[:50]}")
+            print(f"  实得开头：{str(last_write.get('gotHead'))[:50]}")
+            if not last_write.get("hasApi"):
+                print("  → 没找到官方输入 API：说明编辑器组件结构变了，需要更新 findEditorApi")
 
     if "attached" in stages:
         print("✓ 脚本已加载，按钮已挂到输入框工具栏上。")
-        if not any(ev.get("stage") == "composer-seen" for ev in events):
+        if "composer-seen" not in stages:
             print("  （缺 composer-seen，可能只是没记录到首次接手）")
         return 0
     if "attach-failed" in stages:
         print("✗ 找到了 composer，但锚点失配，按钮没挂上。")
-        for ev in events:
+        for ev in recent:
             if ev.get("stage") == "attach-failed":
                 print(f"  hasActions={ev.get('hasActions')} hasEditor={ev.get('hasEditor')}")
         print("  → 需要按当前 DOM 更新 SEL.actions / SEL.editor 选择器。")
@@ -132,7 +137,7 @@ def main() -> int:
         return 1
 
     print("✗ 脚本加载了，但没有找到任何 composer（输入框选择器可能已变）。")
-    for ev in events:
+    for ev in recent:
         if ev.get("stage") == "boot":
             print(f"  boot 时 composers={ev.get('composers')} hasRoot={ev.get('hasRoot')}")
     return 1

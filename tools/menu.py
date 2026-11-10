@@ -7,8 +7,10 @@ cmd.exe 以固定大小的缓冲分块读取批处理文件，UTF-8 的多字节
 把界面文本交给 Python（配合 .bat 里的 chcp 65001）就完全稳定。
 
 用法：
-    python tools/menu.py            交互菜单
-    python tools/menu.py apply      直接执行（用于自动化；apply|status|check|restore）
+    python tools/menu.py                        交互菜单
+    python tools/menu.py apply                  直接执行（apply|status|check|restore）
+    python tools/menu.py --asar E:\\ZCode\\resources\\app.asar apply
+                                                带路径参数（动作与选项前后都行）
 """
 
 from __future__ import annotations
@@ -16,25 +18,50 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from zce_common import force_utf8  # noqa: E402
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PATCH_TOOL = PROJECT_DIR / "tools" / "patch_zcode.py"
 BEACON_TOOL = PROJECT_DIR / "tools" / "check_beacon.py"
 
+# 透传给 patch_zcode 的选项。patch_zcode 的全局选项必须写在子命令之前，
+# 所以 menu 只负责搬运 + 校验，不自己解释这些值。
+PATCH_VALUE_OPTS = ("--asar", "--backup", "--endpoint", "--out")
+PATCH_FLAG_OPTS = ("--force", "--full-verify", "--dry-run")
+FORWARD: list[str] = []
 
-def _force_utf8() -> None:
-    """强制 UTF-8 且按行刷新。
+# 菜单项与键位映射的唯一来源：文案和 CHOICES 都从这里生成，
+# 免得改了一个忘了另一个（早先 MENU 字符串和 CHOICES 字典是两份手抄）。
+ITEMS = [
+    ("1", "apply", "升级后重新注入按钮", "（ZCode 升级后跑这个）"),
+    ("2", "status", "查看注入状态", ""),
+    ("3", "check", "检查按钮是否已挂上", "（ZCode 需正在运行）"),
+    ("4", "restore", "还原 / 彻底移除注入", ""),
+]
+CHOICES = {key: verb for key, verb, _label, _hint in ITEMS}
+MENU_WIDTH = 24  # 标签的显示宽度（按东亚宽字符算 2 列）
 
-    行刷新不是洁癖：本脚本会调起子进程（patch_zcode.py / check_beacon.py），
-    子进程直接写同一个控制台句柄。若父进程的输出被块缓冲，就会出现
-    「[1/2] 检测…」跑到子进程输出之后的错乱顺序（实测如此）。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", line_buffering=True)
-        except (AttributeError, ValueError, OSError):
-            pass
+
+def _pad(text: str, width: int) -> str:
+    """按显示宽度补空格：中文占 2 列，用 ljust 会错位。"""
+    shown = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+    return text + " " * max(1, width - shown)
+
+
+MENU = (
+    "\n"
+    + "=" * 60 + "\n"
+    + "   ZCode 增强提示词 · 维护\n"
+    + "=" * 60 + "\n"
+    + "\n"
+    + "".join(f"   {key}  {_pad(label, MENU_WIDTH)}{hint}".rstrip() + "\n"
+             for key, _verb, label, hint in ITEMS)
+    + "   0  退出\n"
+)
 
 
 def zcode_running() -> bool:
@@ -53,13 +80,18 @@ def run(args: list[str]) -> int:
     return subprocess.call([sys.executable, *args])
 
 
+def run_patch(*cmd: str) -> int:
+    """调用 patch_zcode：全局选项在前，子命令在后。"""
+    return run([str(PATCH_TOOL), *FORWARD, *cmd])
+
+
 def do_apply() -> int:
     print("\n[1/2] 检测 ZCode 是否在运行...")
     running = zcode_running()
     print("      ZCode 正在运行。" if running else "      ZCode 未运行。")
 
-    print("[2/2] 写入注入（幂等，已注入会跳过）...\n")
-    rc = run([str(PATCH_TOOL), "apply"])
+    print("[2/2] 写入注入（幂等：脚本没变会跳过，变了只刷新脚本）...\n")
+    rc = run_patch("apply")
     print()
 
     if rc != 0:
@@ -80,21 +112,27 @@ def do_apply() -> int:
 
 def do_status() -> int:
     print()
-    return run([str(PATCH_TOOL), "status"])
+    return run_patch("status")
 
 
 def do_check() -> int:
+    if FORWARD:
+        print(f"（check 只读信标，忽略参数：{' '.join(FORWARD)}）")
     print("\n读取诊断信标（最多等 30 秒，方便刚重启完就查）...\n")
     return run([str(BEACON_TOOL), "--wait", "30"])
 
 
 def do_restore() -> int:
     print("\n还原会把 app.asar 恢复成注入前的原始版本，按钮随之消失。")
-    answer = input("确认还原？输入 y 继续: ").strip().lower()
+    try:
+        answer = input("确认还原？输入 y 继续: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消。")
+        return 0
     if answer != "y":
         print("已取消。")
         return 0
-    rc = run([str(PATCH_TOOL), "restore"])
+    rc = run_patch("restore")
     print("\n还原后请完全退出并重新打开 ZCode。")
     return rc
 
@@ -106,31 +144,62 @@ VERBS = {
     "restore": do_restore,
 }
 
-MENU = """
-============================================================
-   ZCode 增强提示词 · 维护
-============================================================
 
-   1  升级后重新注入按钮      （ZCode 升级后跑这个）
-   2  查看注入状态
-   3  检查按钮是否已挂上      （ZCode 需正在运行）
-   4  还原 / 彻底移除注入
-   0  退出
-"""
+def parse_argv(argv: list[str]) -> tuple[str | None, list[str]]:
+    """把命令行拆成 (动作, 透传给 patch_zcode 的参数)。
 
-CHOICES = {"1": "apply", "2": "status", "3": "check", "4": "restore"}
+    只认 patch_zcode 真正支持的选项（写错时立刻报错，而不是悄悄忽略）。
+    动作与选项的先后顺序都接受：`apply --asar X` 和 `--asar X apply` 等价。
+    """
+    usage = (
+        "用法：menu.py [apply|status|check|restore] [--asar 路径] [--backup 路径] "
+        "[--endpoint URL] [--out 路径] [--force] [--full-verify] [--dry-run]"
+    )
+    verb: str | None = None
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        name, has_value, _inline = arg.partition("=")
+        if name in PATCH_FLAG_OPTS:
+            if has_value:
+                raise SystemExit(f"{name} 是开关，不接受值\n{usage}")
+            out.append(name)
+            i += 1
+            continue
+        if name in PATCH_VALUE_OPTS:
+            if has_value:
+                out.append(arg)
+                i += 1
+                continue
+            if i + 1 >= len(argv):
+                raise SystemExit(f"{name} 需要一个值，例如 {name} <路径>\n{usage}")
+            out += [name, argv[i + 1]]
+            i += 2
+            continue
+        if arg.startswith("-"):
+            raise SystemExit(f"未知参数：{arg}\n{usage}")
+        if verb is not None:
+            raise SystemExit(f"多给了动作：{verb} 和 {arg}\n{usage}")
+        verb = arg.strip().lower()
+        i += 1
+    return verb, out
 
 
 def main() -> int:
-    _force_utf8()
+    force_utf8(line_buffering=True)
 
-    if len(sys.argv) > 1:
-        verb = sys.argv[1].strip().lower()
-        if verb in VERBS:
-            return VERBS[verb]()
-        print(f"未知参数：{verb}")
-        print("用法：menu.py [apply|status|check|restore]")
+    verb, forward = parse_argv(sys.argv[1:])
+    if verb is not None and verb not in VERBS:
+        print(f"未知动作：{verb}")
+        print("用法：menu.py [apply|status|check|restore] [--asar 路径] ...")
         return 2
+
+    FORWARD.extend(forward)
+    if verb is not None:
+        return VERBS[verb]()
+    if FORWARD:
+        raise SystemExit("请同时指定动作：apply | status | check | restore")
 
     while True:
         print(MENU)
@@ -142,12 +211,12 @@ def main() -> int:
 
         if choice == "0":
             return 0
-        verb = CHOICES.get(choice)
-        if verb is None:
+        action = CHOICES.get(choice)
+        if action is None:
             print(f"无效选择：{choice}")
             continue
 
-        rc = VERBS[verb]()
+        rc = VERBS[action]()
         print("\n按回车返回菜单（或直接关闭窗口）...")
         try:
             input()

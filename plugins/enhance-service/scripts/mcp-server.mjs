@@ -16,7 +16,7 @@
  * 退出条件：stdin 关闭（宿主退出）→ 关掉 HTTP 服务并退出，不留孤儿进程。
  */
 
-import { readFileSync, mkdirSync, appendFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, appendFileSync, statSync, renameSync, rmSync } from 'node:fs';
 import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { createInterface } from 'node:readline';
@@ -25,18 +25,36 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
 const SERVER_NAME = 'enhance-service';
-// 与 .zcode-plugin/plugin.json 的 version 保持一致；不一致时 health 上报会误导排查
-const SERVER_VERSION = '0.1.2';
 
 // scripts/mcp-server.mjs → 插件根目录
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PROMPT_DIR = join(PLUGIN_ROOT, 'prompts');
 
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// 版本号只认 .zcode-plugin/plugin.json，避免三处手抄后各说各话
+const SERVER_VERSION = String(readJson(join(PLUGIN_ROOT, '.zcode-plugin', 'plugin.json'))?.version || '0.0.0');
+
 const PORT = Number(process.env.PROMPT_ENHANCER_PORT || 8770);
 const UPSTREAM_TIMEOUT_MS = 60_000;
+// 模型列表只是「把显示名翻译成 id」的辅助信息，不该把增强拖住
+const MODELS_TIMEOUT_MS = 3_000;
+const MODELS_CACHE_MS = 5 * 60_000;
 // 允许覆盖 provider 配置路径：测试要能把通道 A 关掉（否则会回退到真实网关，测试就不封闭了）
 const ZCODE_PROVIDER_CONFIG = process.env.PROMPT_ENHANCER_ZCODE_CONFIG
   || join(homedir(), '.zcode', 'v2', 'provider_config.json');
+
+// 注入脚本会把草稿原样发过来；10 万字的草稿既超出模型上下文，也白烧钱
+const MAX_INPUT_CHARS = 8_000;
+const MAX_OUT_LEN = 800;
+// 单次 HTTP 请求体上限：按钮只会发一段草稿，留足余量即可
+const MAX_BODY_BYTES = 256 * 1024;
 
 const QUOTE_CHARS = '"\'“”‘’';
 const FENCE_RE = /^\s*```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n?\s*```\s*$/;
@@ -56,13 +74,77 @@ const log = (...args) => process.stderr.write(`[enhance-service] ${args.join(' '
 // 信标单独落一份文件。为什么不能只靠 stderr：实测 ZCode 只把插件 stderr 的少数几行
 // 采进它的 jsonl 日志（2026-11-10 核对：启动重试那 2 行进了，信标 0 条），
 // 而「按钮没出现」的排查完全依赖这些信标。退役旧 Python 服务后就靠这个文件。
-const BEACON_LOG = process.env.PROMPT_ENHANCER_BEACON_LOG
-  || join(process.env.LOCALAPPDATA || homedir(), 'zcode-prompt-enhance', 'beacon.log');
+const RUNTIME_DIR = join(process.env.LOCALAPPDATA || homedir(), 'zcode-prompt-enhance');
+const BEACON_LOG = process.env.PROMPT_ENHANCER_BEACON_LOG || join(RUNTIME_DIR, 'beacon.log');
+const MAX_BEACON_LOG_BYTES = 5 * 1024 * 1024;
+
+// 访问令牌：打补丁时由 patch_zcode.py 写进这个文件、同时注入到渲染层脚本。
+// 没有它，本机浏览器里任何一个网页都能 POST /api/enhance —— 用用户的 key 花用户的钱。
+const TOKEN_FILE = process.env.PROMPT_ENHANCER_TOKEN_FILE || join(RUNTIME_DIR, 'token');
+
+function readToken() {
+  try {
+    return readFileSync(TOKEN_FILE, 'utf8').trim();
+  } catch {
+    return ''; // 还没打过补丁（或用户删了），退回「只做 Origin 校验」的旧行为
+  }
+}
+
+// 启动时读一次作为兜底；请求时再重读（见 currentToken）。
+const STARTUP_TOKEN = readToken();
+if (!STARTUP_TOKEN) {
+  log(`⚠ 没有读到令牌文件 ${TOKEN_FILE}：浏览器来源的请求将只校验 Origin。`
+    + ' 先运行一次「修复增强提示词按钮.bat」的注入流程生成令牌。');
+}
+
+/**
+ * 当前令牌：每次请求重读文件。
+ *
+ * 为什么不能缓存成常量：apply 会在令牌文件缺失时重新生成一个并写进注入脚本，
+ * 而本进程通常比一次 apply 活得久。早先缓存常量，重新注入后按钮会一路 401，
+ * 只能靠重启 ZCode 恢复（用户看到的是"按钮在但一点就失败"，很难联想到令牌）。
+ * 文件读不到时回退到启动时的值：既保持旧令牌仍然生效，也不会静默放开校验。
+ */
+function currentToken() {
+  return readToken() || STARTUP_TOKEN;
+}
+
+function rotateBeaconLog() {
+  try {
+    if (statSync(BEACON_LOG).size < MAX_BEACON_LOG_BYTES) return;
+  } catch {
+    return; // 文件还不存在
+  }
+  try {
+    rmSync(`${BEACON_LOG}.1`, { force: true });
+    renameSync(BEACON_LOG, `${BEACON_LOG}.1`);
+  } catch {
+    /* 轮转失败不该影响写入 */
+  }
+}
 
 function appendBeacon(raw) {
+  const text = String(raw).slice(0, 2000);
+  let payload;
+  try {
+    const parsed = JSON.parse(text);
+    payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { raw: text };
+  } catch {
+    payload = { raw: text };
+  }
+  // 落盘一律单行 JSON：客户端塞进来的换行会被转义，
+  // 否则任何人都能伪造一整行信标，把 check_beacon 的结论带偏。
+  // 客户端 ts 另存 clientTs：它记录"页面何时发出"，服务端 ts 记录"何时落盘"。
+  // 早先直接覆盖客户端 ts，排查时就分不清是上报延迟还是服务端排队。
+  const now = new Date().toISOString();
+  const record = { ...payload };
+  if (record.ts !== undefined && record.ts !== null) record.clientTs = record.ts;
+  record.ts = now;
+  const line = `${JSON.stringify(record)}\n`;
   try {
     mkdirSync(dirname(BEACON_LOG), { recursive: true });
-    appendFileSync(BEACON_LOG, `${new Date().toISOString()} ${String(raw).slice(0, 2000)}\n`, 'utf8');
+    rotateBeaconLog();
+    appendFileSync(BEACON_LOG, line, 'utf8');
   } catch {
     /* 落盘失败不影响给注入脚本的响应 */
   }
@@ -111,38 +193,38 @@ class UpstreamError extends Error {
   }
 }
 
-function readJson(path) {
-  try {
-    return JSON.parse(readFileSync(path, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-/** 通道 A：读 ZCode 自己的 provider 配置，等价于「用它当前在用的模型」。 */
+/**
+ * 通道 A：读 ZCode 自己的 provider 配置，等价于「用它当前在用的模型」。
+ *
+ * 取第一条**真正可用**的规则，而不是 rules[0]：多 provider 配置下第一条可能已被
+ * 停用、或根本没填 baseUrl，那样会白白丢掉一个可用通道并回退到通道 B。
+ */
 function readZcodeChannel() {
   const cfg = readJson(ZCODE_PROVIDER_CONFIG);
   if (!cfg) return null;
   const container = cfg.config ?? {};
   const rules = container.providerConfigRules?.providerRules ?? [];
-  if (!rules.length) return null;
-  const rule = rules[0];
-  const providerId = rule.providerId;
-  const baseUrl = String(rule.config?.api?.baseUrl ?? '').replace(/\/+$/, '');
-  const apiKey = String(rule.config?.access?.apiKey ?? '').trim();
-  if (!baseUrl) return null;
 
-  const models = [];
-  for (const mr of container.modelConfigRules?.providerModelRules ?? []) {
-    if (mr.providerId !== providerId) continue;
-    if (mr.config?.enabled === false) continue;
-    if (mr.modelId) models.push(mr.modelId);
+  for (const rule of rules) {
+    if (!rule || rule.enabled === false) continue;
+    const baseUrl = String(rule.config?.api?.baseUrl ?? '').replace(/\/+$/, '');
+    if (!baseUrl) continue;
+
+    const models = [];
+    for (const mr of container.modelConfigRules?.providerModelRules ?? []) {
+      if (mr.providerId !== rule.providerId) continue;
+      if (mr.config?.enabled === false) continue;
+      if (mr.modelId) models.push(mr.modelId);
+    }
+    return {
+      name: 'zcode',
+      label: `ZCode 当前配置（${rule.providerName || rule.providerId}）`,
+      baseUrl,
+      apiKey: String(rule.config?.access?.apiKey ?? '').trim(),
+      models,
+    };
   }
-  return {
-    name: 'zcode',
-    label: `ZCode 当前配置（${rule.providerName || providerId}）`,
-    baseUrl, apiKey, models,
-  };
+  return null;
 }
 
 /** 通道 B：环境变量优先，其次插件目录下的 config.json / config.local.json。 */
@@ -157,15 +239,17 @@ function readFallbackChannel() {
       models: process.env.PROMPT_ENHANCER_MODEL ? [process.env.PROMPT_ENHANCER_MODEL] : [],
     };
   }
-  const cfg = readJson(join(PLUGIN_ROOT, 'config.json'))
-    ?? readJson(join(PLUGIN_ROOT, 'config.local.json'));
-  if (!cfg?.baseUrl) return null;
+  // 逐个校验，别用 `a ?? b`：a 存在但没写 baseUrl 时，b 根本没机会被读到。
+  const picked = [readJson(join(PLUGIN_ROOT, 'config.json')),
+    readJson(join(PLUGIN_ROOT, 'config.local.json'))]
+    .find((c) => c && typeof c.baseUrl === 'string' && c.baseUrl.trim());
+  if (!picked) return null;
   return {
     name: 'fallback',
     label: '自配端点',
-    baseUrl: String(cfg.baseUrl).replace(/\/+$/, ''),
-    apiKey: String(cfg.apiKey ?? ''),
-    models: cfg.model ? [cfg.model] : [],
+    baseUrl: String(picked.baseUrl).replace(/\/+$/, ''),
+    apiKey: String(picked.apiKey ?? ''),
+    models: picked.model ? [picked.model] : [],
   };
 }
 
@@ -227,14 +311,20 @@ function requestJson(urlStr, { method = 'POST', headers = {}, body = null, timeo
   });
 }
 
-async function listModels(ch) {
+const modelCache = new Map(); // baseUrl -> { at, models }
+
+async function listModels(ch, timeoutMs = MODELS_TIMEOUT_MS) {
+  const cached = modelCache.get(ch.baseUrl);
+  if (cached && Date.now() - cached.at < MODELS_CACHE_MS) return cached.models;
   try {
-    const data = await requestJson(`${ch.baseUrl}/models`, { method: 'GET', headers: authHeaders(ch) });
-    return (data.data ?? [])
+    const data = await requestJson(`${ch.baseUrl}/models`, { method: 'GET', headers: authHeaders(ch), timeoutMs });
+    const models = (data.data ?? [])
       .filter((m) => m && m.id)
       .map((m) => ({ id: m.id, name: m.name || m.id }));
+    modelCache.set(ch.baseUrl, { at: Date.now(), models });
+    return models;
   } catch {
-    return [];
+    return []; // 列出模型失败不影响增强，后续按通道配置的模型继续
   }
 }
 
@@ -260,7 +350,13 @@ function loadPrompt(name) {
 
 async function callEnhance(ch, model, text) {
   const systemPrompt = loadPrompt('enhance_system.txt');
-  const userPrompt = loadPrompt('enhance_user.txt').replace('{input}', text);
+  const template = loadPrompt('enhance_user.txt');
+  if (!template.includes('{input}')) {
+    throw new UpstreamError('enhance_user.txt 缺少 {input} 占位符');
+  }
+  // 必须用 split/join 而不是 replace(pattern, text)：
+  // 后者会把草稿里的 $&、$`、$' 当成替换模式，把用户内容改得面目全非。
+  const userPrompt = template.split('{input}').join(text);
   const data = await requestJson(`${ch.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(ch) },
@@ -288,6 +384,14 @@ async function enhance(text, requestedModel = '') {
   if (!input) {
     return { success: false, text: '', code: 'empty_input', error: '请先输入需要增强的提示词' };
   }
+  if (input.length > MAX_INPUT_CHARS) {
+    return {
+      success: false,
+      text: '',
+      code: 'input_too_long',
+      error: `草稿 ${input.length} 字，超过 ${MAX_INPUT_CHARS} 字上限；请先精简再增强`,
+    };
+  }
 
   const channels = buildChannels();
   if (!channels.length) {
@@ -296,7 +400,9 @@ async function enhance(text, requestedModel = '') {
 
   const attempts = [];
   for (const ch of channels) {
-    const available = await listModels(ch);
+    // 前端已经点名了通道自带的模型 id 时，没必要再打一次 /models
+    const known = requestedModel && ch.models.includes(requestedModel);
+    const available = known ? [] : await listModels(ch);
     const model = resolveModel(ch, requestedModel, available);
     if (!model) {
       attempts.push({ channel: ch.name, code: 'llm_error', error: '该通道没有可用模型' });
@@ -319,7 +425,8 @@ async function enhance(text, requestedModel = '') {
         channelLabel: ch.label,
         elapsedMs: Date.now() - started,
         removedMetaLines,
-        overLength: cleaned.length > 800,
+        maxLength: MAX_OUT_LEN,
+        overLength: cleaned.length > MAX_OUT_LEN,
       };
     } catch (err) {
       attempts.push({
@@ -336,45 +443,120 @@ async function enhance(text, requestedModel = '') {
 
 // ------------------------------------------------------------------ HTTP（供注入的按钮调用）
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-};
+const ALLOW_HEADERS = 'Content-Type, X-ZCE-Token';
 
-function sendJson(res, status, body) {
+/**
+ * 谁可以读响应。
+ *
+ * 之前是 `Access-Control-Allow-Origin: *`：本机浏览器里任何一个网页都能
+ * POST /api/enhance（花用户的 API 额度）、读 /api/health（上游地址与模型列表）、
+ * 往 /api/beacon 里灌日志。这里只放行「本机来源」与「应用自己的自定义协议」，
+ * http(s) 站点一律拒绝；浏览器来源还要求带令牌（见 TOKEN_FILE）。
+ */
+function originAllowed(origin) {
+  if (!origin) return true; // 非浏览器调用（curl / PowerShell / 本地脚本）
+  if (origin === 'null') return true; // file:// 页面、沙箱 iframe —— 仍需令牌
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return true; // 渲染层自定义协议
+    return url.hostname === '127.0.0.1' || url.hostname === 'localhost';
+  } catch {
+    return false;
+  }
+}
+
+function corsFor(origin) {
+  if (!origin || !originAllowed(origin)) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Headers': ALLOW_HEADERS,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    Vary: 'Origin',
+  };
+}
+
+function sendJson(res, status, body, cors = {}) {
+  if (!res || res.writableEnded || res.destroyed) return; // 客户端提前断开时别再写
   const raw = Buffer.from(JSON.stringify(body), 'utf8');
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': raw.length, ...CORS });
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': raw.length,
+    ...cors,
+  });
   res.end(raw);
 }
 
-function readBody(req) {
-  return new Promise((resolve) => {
+function readBody(req, limit = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let failed = false;
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('data', (chunk) => {
+      if (failed) return; // 超限后继续接收但丢弃，保证 413 能正常送达
+      size += chunk.length;
+      if (size > limit) {
+        failed = true;
+        const err = new Error(`请求体超过 ${limit} 字节`);
+        err.statusCode = 413;
+        reject(err);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!failed) resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', (err) => {
+      if (!failed) reject(err);
+    });
   });
 }
 
 function createHttpServer() {
   return createServer(async (req, res) => {
-    const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+    // 这段必须在 try 之外先解析，否则畸形请求行（例如 "GET //"）会让 async 回调
+    // 抛未捕获异常，Node 默认直接结束进程 —— 任何一个本机进程都能打掉服务。
+    let url;
+    try {
+      url = new URL(req.url || '/', `http://127.0.0.1:${PORT}`);
+    } catch {
+      sendJson(res, 400, { success: false, error: 'bad request target' });
+      return;
+    }
+
+    const origin = req.headers.origin;
+    if (!originAllowed(origin)) {
+      sendJson(res, 403, { success: false, error: 'forbidden origin' });
+      return;
+    }
+    const cors = corsFor(origin);
+
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, CORS);
+      res.writeHead(204, cors);
       res.end();
       return;
     }
+    // 浏览器来源必须带令牌；不开 Origin 的本地命令行工具照旧可用（README 里的 curl 用法）
+    const token = currentToken();
+    if (origin && token && req.headers['x-zce-token'] !== token) {
+      sendJson(res, 401, { success: false, error: 'missing or invalid token' }, cors);
+      return;
+    }
+
     try {
       if (req.method === 'GET' && url.pathname === '/api/health') {
         const channels = buildChannels();
         sendJson(res, 200, {
           ok: true,
           pid: process.pid,
+          port: servedPort(),
           version: SERVER_VERSION,
+          tokenRequired: !!token,
+          tokenFile: TOKEN_FILE,
           channels: channels.map((c) => ({
             name: c.name, label: c.label, baseUrl: c.baseUrl, hasKey: !!c.apiKey, models: c.models.slice(0, 8),
           })),
-        });
+        }, cors);
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/models') {
@@ -386,14 +568,14 @@ function createHttpServer() {
           channel: ch?.name ?? null,
           channelLabel: ch?.label ?? null,
           source: models.length ? 'upstream' : 'empty',
-        });
+        }, cors);
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/beacon') {
-        const raw = await readBody(req);
+        const raw = await readBody(req, 64 * 1024);
         appendBeacon(raw);
         log('beacon', raw.slice(0, 1000));
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 200, { ok: true }, cors);
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/enhance') {
@@ -401,15 +583,17 @@ function createHttpServer() {
         try {
           body = JSON.parse((await readBody(req)) || '{}');
         } catch (err) {
-          sendJson(res, 400, { success: false, text: '', code: 'unknown', error: `请求体不是合法 JSON：${err.message}` });
+          sendJson(res, 400, { success: false, text: '', code: 'unknown', error: `请求体不是合法 JSON：${err.message}` }, cors);
           return;
         }
-        sendJson(res, 200, await enhance(body.text, body.model));
+        sendJson(res, 200, await enhance(body.text, body.model), cors);
         return;
       }
-      sendJson(res, 404, { error: 'not found' });
+      sendJson(res, 404, { error: 'not found' }, cors);
     } catch (err) {
-      sendJson(res, 500, { success: false, text: '', code: 'unknown', error: err?.message ?? String(err) });
+      sendJson(res, err?.statusCode || 500, {
+        success: false, text: '', code: 'unknown', error: err?.message ?? String(err),
+      }, cors);
     }
   });
 }
@@ -445,10 +629,11 @@ async function callTool(name, args) {
   if (name === 'enhance_service_status') {
     const body = {
       pid: process.pid,
-      port: PORT,
+      port: servedPort(),
       listening: httpState.listening,
       version: SERVER_VERSION,
       promptRoot: PROMPT_DIR,
+      beaconLog: BEACON_LOG,
       channels: buildChannels().map((c) => ({ name: c.name, label: c.label, baseUrl: c.baseUrl, hasKey: !!c.apiKey, models: c.models })),
     };
     return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
@@ -485,7 +670,16 @@ async function handleMessage(message) {
 
 // ------------------------------------------------------------------ 启动
 
-const httpState = { listening: false, server: null };
+const httpState = { listening: false, server: null, port: null };
+
+/**
+ * 实际监听端口。
+ * PROMPT_ENHANCER_PORT=0 时由系统分配（测试用它避免固定端口被占），
+ * 所以对外报告/打印的必须是真实端口，不能直接用常量 PORT。
+ */
+function servedPort() {
+  return httpState.port ?? PORT;
+}
 
 async function startHttp(fastRetries = 15, fastDelayMs = 20_000, slowDelayMs = 300_000) {
   const attempt = (n) =>
@@ -508,7 +702,8 @@ async function startHttp(fastRetries = 15, fastDelayMs = 20_000, slowDelayMs = 3
       });
       server.listen(PORT, '127.0.0.1', () => {
         httpState.listening = true;
-        log(`HTTP 已监听 http://127.0.0.1:${PORT}（pid=${process.pid}）`);
+        httpState.port = server.address()?.port ?? PORT;
+        log(`HTTP 已监听 http://127.0.0.1:${servedPort()}（pid=${process.pid}）`);
         resolve();
       });
     });
@@ -531,6 +726,11 @@ function shutdown(reason) {
 }
 
 async function main() {
+  // 进程级兜底：这个进程是 ZCode 的子进程，静默退出会让按钮和 MCP 工具一起失效。
+  // 记录后继续运行，比直接崩掉更容易排查。
+  process.on('uncaughtException', (err) => log(`uncaughtException：${err?.stack ?? err}`));
+  process.on('unhandledRejection', (err) => log(`unhandledRejection：${err?.stack ?? err}`));
+
   // HTTP 必须"发起来就走"，绝不能 await 在 MCP 之前。
   // 教训（2026-11-10 实测）：早先写成 `await startHttp()`，而端口被占时是无限重试，
   // 于是它永远不返回 → 后面的 stdio 循环没建立 → 宿主的 initialize 收不到回复
@@ -569,4 +769,7 @@ if (process.env.ENHANCE_SERVICE_AS_LIB !== '1') {
   });
 }
 
-export { enhance, cleanResult, stripWrappingQuotes, stripMetaLines, resolveModel, buildChannels, readZcodeChannel };
+export {
+  enhance, cleanResult, stripWrappingQuotes, stripMetaLines, resolveModel,
+  buildChannels, readZcodeChannel, readFallbackChannel, originAllowed, readToken,
+};

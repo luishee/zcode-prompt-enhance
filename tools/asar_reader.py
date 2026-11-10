@@ -7,6 +7,7 @@
 """
 
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 
 class Asar:
     def __init__(self, path):
+        self.path = str(path)
         self.fp = open(path, 'rb')
         # 实测字段含义（2026-11-10，与 tools/patch_zcode.py 的写入口径一致）：
         #   prefix[0:4]  = 4（第一段 pickle 的载荷长度）
@@ -28,6 +30,20 @@ class Asar:
         raw = self.fp.read(json_len)
         self.header = json.loads(raw.decode('utf-8'))
         self.base = 8 + header_size
+        self.file_size = os.fstat(self.fp.fileno()).st_size
+
+    def close(self):
+        """显式关闭。必须提供：Windows 上只要读句柄还开着，
+        对同一个文件的 os.replace 就会报 PermissionError。"""
+        if not self.fp.closed:
+            self.fp.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     def _node(self, rel):
         node = self.header
@@ -43,8 +59,14 @@ class Asar:
         node = self._node(rel)
         if node is None or 'offset' not in node:
             raise FileNotFoundError(rel)
-        self.fp.seek(self.base + int(node['offset']))
-        return self.fp.read(int(node['size']))
+        offset = int(node['offset'])
+        size = int(node['size'])
+        # 越界检查：头部偏移算错时，与其静默返回半截数据让人以为「内容不一致」，
+        # 不如直接报出来，指向真正的原因。
+        if offset < 0 or size < 0 or self.base + offset + size > self.file_size:
+            raise ValueError(f'{rel} 的偏移越界：offset={offset} size={size} 文件={self.file_size}')
+        self.fp.seek(self.base + offset)
+        return self.fp.read(size)
 
     def find(self, suffix, root=''):
         """递归列出路径以 suffix 结尾的文件。
@@ -67,6 +89,16 @@ class Asar:
                 elif full.endswith(suffix):
                     found.append(full)
         return found
+
+
+def iter_leaves(node, prefix=""):
+    """遍历所有叶子条目，产出 (相对 asar 根的路径, 元数据)。"""
+    for name, child in node.get("files", {}).items():
+        full = f"{prefix}/{name}".lstrip("/")
+        if "files" in child:
+            yield from iter_leaves(child, full)
+        else:
+            yield full, child
 
 
 if __name__ == '__main__':

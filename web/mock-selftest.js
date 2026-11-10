@@ -98,7 +98,9 @@
       const url = typeof input === 'string' ? input : (input && input.url) || '';
       if (url.includes('/api/enhance')) {
         return Promise.resolve({
+          ok: true,
           status: 200,
+          text: () => Promise.resolve(''),
           json: () => Promise.resolve({ success: false, text: '', code: 'llm_error', error: '模型返回空结果' }),
         });
       }
@@ -169,7 +171,37 @@
     check('写回全失败 → 上报 write-failed 信标（含策略与长度）',
       !!failBeacon && Array.isArray(failBeacon.body.tried) && typeof failBeacon.body.wantLen === 'number',
       failBeacon ? JSON.stringify(failBeacon.body).slice(0, 120) : '无信标');
+    // 会话 id 是 check_beacon 区分「本次启动 / 上次启动」的唯一依据：
+    // 只按 url 划分会把上次的 attached 算成本次成功（会误报"已挂上"）。
+    check('信标带 session 与 url（供 check_beacon 区分本次启动）',
+      !!failBeacon && typeof failBeacon.body.session === 'string' && failBeacon.body.session.length >= 8
+      && String(failBeacon.body.url).startsWith('file://'),
+      failBeacon ? `session=${failBeacon.body.session}` : '无信标');
     editor.setAttribute('contenteditable', 'true');
+
+    // ---- 10. 增强后用户又改了草稿 → 「还原原文」必须失效 ----
+    // 否则点还原会把用户刚写的内容整个覆盖掉，而界面上看不出会发生什么。
+    setDraft('原始草稿A');
+    await click(button);
+    await wait(80);
+    check('增强后出现还原按钮', !!revertBtn() && revertBtn().hidden === false);
+    setDraft('用户又改了');
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(450); // 失效判定有 300ms 防抖
+    check('草稿被改动后还原按钮消失', !!revertBtn() && revertBtn().hidden === true);
+    check('改动后的内容没有被覆盖', text(editor) === '用户又改了', text(editor));
+
+    // ---- 11. 请求途中取消：不写回、不覆盖草稿、状态显示已取消 ----
+    window.__mockDelay = 200;
+    setDraft('取消测试');
+    await click(button);
+    check('增强中按钮进入禁用态', button.disabled === true);
+    await click(button); // 再点一次 = 取消
+    await wait(400); // 等 mock 的延迟彻底过去，确认迟到的结果不会写回
+    check('取消后草稿保持原样', text(editor) === '取消测试', text(editor));
+    check('取消后状态显示已取消', text(status()).includes('已取消'), text(status()));
+    check('取消后按钮恢复可点', button.disabled === false);
+    window.__mockDelay = 0;
 
     finish();
   }

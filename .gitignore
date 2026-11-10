@@ -2,7 +2,7 @@
 patch-state.json
 
 # 运行时产物
-logs/
+build/
 *.dryrun
 *.zce-tmp
 
@@ -18,8 +18,10 @@ __pycache__/
 .venv/
 node_modules/
 
-# 测试生成物
+# 测试生成物（正常结束会自删，中途失败可能残留）
 web/zcode-enhance.local.js
+tests/*.log
+tests/token-test.txt
 
 # 编辑器与系统文件
 .vscode/

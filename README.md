@@ -260,10 +260,13 @@ python "<项目目录>\tools\patch_zcode.py" apply
 
 写入行为（`apply` 的约定）：
 
-- **幂等**：已注入则跳过写入；
-- **写完即自检**：只允许 `index.html` 变化 + 新增注入脚本，逐字节比对约 3.18 万个文件；
-- **校验不过自动回滚**：就地还原并返回非 0 退出码，绝不留一个启动不了的半成品；
-- **写入双保险**：优先原子替换，`Program Files` 下遇到 `PermissionError` 自动回落为就地覆写；
+- **幂等**：已注入且脚本内容未变则跳过；内容变了只刷新注入脚本（不重复插标签、不重做基线）；
+- **写完即自检**：首次注入允许 `index.html` 变化 + 新增注入脚本，逐字节比对约 3.18 万个文件；
+  刷新脚本时改为把新写入的两个条目逐字节读回比对；
+- **校验不过自动回滚**：就地还原并返回非 0 退出码，绝不留一个启动不了的半成品
+  （刷新路径若没有基线则不回滚，只报错并提示修复安装）；
+- **写入是原子替换**：临时文件 + `os.replace`，被占用时直接报错让人退出 ZCode，
+  不再"就地覆写"（那种写法一旦中断就留下半截 asar）；
 - **备份放安装目录之外**：`%LOCALAPPDATA%\zcode-prompt-enhance\backups\app.asar.<版本>.<哈希>.orig`，
   并自动只保留当前基线 + 最近 1 份（每份约 374MB）。放在 `resources/` 里会被升级安装器一起删掉。
 
@@ -322,10 +325,16 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 
 | 接口 | 方法 | 说明 |
 | --- | --- | --- |
-| `/api/health` | GET | 服务与通道状态 |
+| `/api/health` | GET | 服务与通道状态（含 `tokenRequired`） |
 | `/api/models` | GET | 模型列表（`source: upstream` 表示真的从上游取到了） |
-| `/api/enhance` | POST | `{text, model?}` → `{success, text, model, channel, elapsedMs, removedMetaLines, overLength}` |
-| `/api/beacon` | POST | 注入脚本上报诊断信标（写 `%LOCALAPPDATA%\zcode-prompt-enhance\beacon.log`） |
+| `/api/enhance` | POST | `{text, model?}` → `{success, text, model, channel, elapsedMs, removedMetaLines, maxLength, overLength}`；草稿超 8000 字返回 `code: input_too_long` |
+| `/api/beacon` | POST | 注入脚本上报诊断信标（写 `%LOCALAPPDATA%\zcode-prompt-enhance\beacon.log`，单行 JSON、5MB 轮转） |
+
+> **谁能调这些接口**：只接受本机来源。不带 `Origin` 的命令行调用（上面的 PowerShell 示例）直接可用；
+> `file://` / 应用自定义协议（`Origin: null`）必须带 `X-ZCE-Token` —— 令牌由 `apply` 生成在
+> `%LOCALAPPDATA%\zcode-prompt-enhance\token`，同时写进注入脚本；外部 `http(s)://` 站点一律 403。
+> 请求体上限 256KB（信标 64KB），超出返回 413。
+> 收紧的原因：`Access-Control-Allow-Origin: *` 时代，浏览器里任意网页都能用你的 key 调 `/api/enhance`。
 
 上游调用参数：`temperature: 0.3`（改写任务要稳）、`max_tokens: 1200`、超时 60 秒。
 
@@ -349,7 +358,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `PROMPT_ENHANCER_API_KEY` | 空 | 通道 B 的 key |
 | `PROMPT_ENHANCER_MODEL` | 空 | 通道 B 默认模型 |
 | `PROMPT_ENHANCER_PREFER` | `zcode` | 通道优先级：`zcode` 或 `fallback` |
-| `PROMPT_ENHANCER_PORT` | `8770` | 服务端口（改了之后要 `restore` 再用 `--endpoint http://127.0.0.1:<新端口>` 重新 `apply`） |
+| `PROMPT_ENHANCER_PORT` | `8770` | 服务端口（改了之后用 `--endpoint http://127.0.0.1:<新端口>` 再跑一次 `apply` 刷新脚本即可） |
 | `PROMPT_ENHANCER_ZCODE_CONFIG` | `~/.zcode/v2/provider_config.json` | 通道 A 的配置路径（测试用） |
 | `PROMPT_ENHANCER_BEACON_LOG` | `%LOCALAPPDATA%\zcode-prompt-enhance\beacon.log` | 信标落盘路径 |
 
@@ -406,9 +415,15 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 修复增强提示词按钮.bat status     :: 查看状态
 修复增强提示词按钮.bat check      :: 读信标检查按钮
 修复增强提示词按钮.bat restore    :: 还原（仍会要求输入 y）
+
+:: 指定非默认安装位置 / 端点（选项写在动作之后）
+修复增强提示词按钮.bat apply --asar "E:\Apps\ZCode\resources\app.asar"
 ```
 
 - 参数会原样传给 `tools/menu.py`，等价于 `python tools/menu.py apply`；
+- `--asar` / `--backup` / `--endpoint` / `--out` 会被搬运给 `patch_zcode.py`
+  （`patch_zcode` 要求选项在子命令之前，`menu.py` 负责摆正顺序）；
+  `--force` / `--full-verify` / `--dry-run` 三个开关同样可以透传；
 - **退出码**：`0` 成功；`1` 执行失败（如权限被拒、找不到备份）；`2` 参数不认识；
 - 只有**失败时**窗口才会 `pause` 停住（方便看报错），成功时执行完直接关闭——适合放进脚本/任务计划；
 - 还原若要全自动，用 `echo y | 修复增强提示词按钮.bat restore`；
@@ -436,16 +451,29 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 
 | 命令 | 用途 |
 | --- | --- |
-| `python tools/patch_zcode.py apply` | 注入（**幂等**：已注入会跳过）；升级后跑这条 |
+| `python tools/patch_zcode.py apply` | 注入（**幂等**：脚本没变就跳过，变了只刷新脚本）；升级后跑这条 |
 | `python tools/patch_zcode.py status` | 查看注入状态与备份位置 |
-| `python tools/patch_zcode.py restore` | 回滚到基线备份 |
+| `python tools/patch_zcode.py restore` | 回滚到基线备份（还原后校验 SHA256，并清掉状态里的"已打补丁"） |
 | `python tools/patch_zcode.py verify` | 读回校验 + 抽样比对（没有基线备份时跳过抽样） |
-| `python tools/patch_zcode.py --dry-run apply` | 演练：写到 `<asar>.dryrun`，不动原文件、不写状态 |
+| `python tools/patch_zcode.py --full-verify apply` | 强制在写完后做全量逐字节比对（刷新时默认只校验注入的两个条目） |
+| `python tools/patch_zcode.py --force apply` | 允许"没有基线备份时仍删除 integrity 字段"（默认会拦下并说明原因） |
+| `python tools/patch_zcode.py --dry-run apply` | 演练：写到 `build/app.asar.dryrun`，不动原文件、不写状态、不生成令牌 |
 | `python tools/verify_patch.py --original <备份> --patched <asar>` | 全量逐字节校验（实测约 3.18 万文件） |
-| `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步 |
-| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 23 项 DOM 断言 |
-| `node tests/test_mcp_server.mjs` | 插件服务测试（43 项，含生命周期与端口冲突） |
+| `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步（只统计本次启动） |
+| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 31 项 DOM 断言 |
+| `node tests/test_mcp_server.mjs` | 插件服务测试（66 项，含生命周期、端口冲突、令牌热更新） |
+| `python tests/test_patch_zcode.py` | asar 写入层测试（45 项：apply/幂等/刷新/还原/无基线保护） |
 | `python tools/menu.py [apply\|status\|check\|restore]` | `.bat` 的实际实现，也可直接调 |
+
+`--asar` / `--backup` / `--endpoint` 三个选项可以透传给 `.bat`（写在动作之后，选项在子命令之前）：
+
+```bat
+修复增强提示词按钮.bat apply --asar "E:\Apps\ZCode\resources\app.asar"
+修复增强提示词按钮.bat status --endpoint http://127.0.0.1:8771
+```
+
+不给 `--asar` 时，按「状态文件里上次记录的路径 → `ZCODE_ASAR` → 内置默认值」的顺序解析，
+所以换过安装位置后不必每次手写。
 
 所有脚本都按**自身位置**定位项目和默认路径，不依赖当前工作目录。
 
@@ -484,7 +512,7 @@ python "<项目目录>\tools\patch_zcode.py" apply
 ZCode 升级会用安装器替换 resources/，导致注入的「增强提示词」按钮消失。请在本项目内完成重新注入：
 
 1. 运行 python tools/patch_zcode.py status，判断当前是「已打补丁」还是「原始」。
-2. 若为「原始」，运行 python tools/patch_zcode.py apply 重新注入（幂等；会自动建基线备份、写完自检，校验不过会自己回滚并返回非 0）。
+2. 运行 python tools/patch_zcode.py apply 重新注入（幂等；首次注入会自动建基线备份、写完自检，校验不过会自己回滚并返回非 0；已注入的包则只刷新脚本）。
 3. 校验未通过或状态异常时，用 python tools/verify_patch.py --original <备份> --patched "D:\Program Files\ZCode\resources\app.asar" 做全量逐字节比对，要求「非预期差异 0」；仍不过就运行 python tools/patch_zcode.py restore 回滚并报告原因。
 4. 完成后提醒我：完全退出并重开 ZCode。服务层是插件，不用管。
 5. 顺带确认官方是否已自带该功能：若渲染层已出现 chat.promptEnhance 的实现代码（不只是文案），提示我可以执行 restore 退役注入层。
@@ -519,6 +547,10 @@ python "<项目目录>\tools\patch_zcode.py" restore
 > **基线备份被删除过时**：`restore` 需要注入前的原始包，`status` 会显示 `备份: 已被删除（无回滚基线）`。
 > 这时 `restore` 不可用，补救办法是：修复安装 / 重装 ZCode（会重装 `resources/`，等效回到原始状态），
 > 或等下次 ZCode 升级后执行 `apply`（那时会自动建立新的基线）。备份约 374MB，删掉能省空间但会失去回滚能力。
+>
+> 同一状态下，如果某次注入**必须改动 `integrity` 字段**才能腾出 JSON 空间，`apply` 会直接拒绝并说明原因
+> （既没有 backup 可 `restore`，也没有比对基准可自动回滚）。确认风险后加 `--force` 才会继续；
+> 通常只有 ZCode 换了打包格式或头部余量变小才会遇到。
 
 **彻底卸载：**
 
@@ -561,6 +593,10 @@ python "<项目目录>\tools\patch_zcode.py" restore
 | `attached` | 按钮已挂上，附挂载点 class |
 | `attach-failed` | 找到了 composer 但锚点失配 |
 | `write-ok` / `write-failed` | 写回编辑器的结果，失败时附尝试过的策略与长度 |
+
+每条信标都带 `session`（每次页面加载一个）与 `clientTs`（页面发出的时间），
+`check_beacon.py` **只统计最后一次启动**的信标——否则上一次运行成功留下的 `attached`
+会冒充本次成功。日志长到几轮会话后，它打印的是**最后 40 条**，避免看到几天前的旧记录。
 
 ### 按钮在，但点了报错
 
@@ -605,12 +641,15 @@ zcode-prompt-enhance/
 ├─ inject/zcode-enhance.js         注入到渲染层的脚本（按钮本体）
 ├─ tools/
 │   ├─ asar_reader.py              asar 读取
+│   ├─ zce_common.py               共用常量（注入路径/脚本标签）与控制台 UTF-8
 │   ├─ patch_zcode.py              打补丁 / 还原 / 查看状态
 │   ├─ verify_patch.py             全量逐字节校验
 │   ├─ check_beacon.py             读信标定位按钮不出现的原因
 │   ├─ run_dom_test.py             无头浏览器 DOM 自测
 │   └─ menu.py                     维护菜单（.bat 的实际内容）
-├─ tests/test_mcp_server.mjs       插件服务测试（43 项，含生命周期与端口冲突）
+├─ tests/
+│   ├─ test_mcp_server.mjs         插件服务测试（66 项，含生命周期与令牌热更新）
+│   └─ test_patch_zcode.py         asar 写入层测试（45 项，用合成小包）
 ├─ web/                            本地预览页 + DOM 自测用页面
 ├─ 修复增强提示词按钮.bat          维护入口（双击运行：注入/状态/检查/还原）
 ├─ .env.example                    通道 B 环境变量参考（不会被自动加载）
@@ -622,23 +661,30 @@ zcode-prompt-enhance/
 ## 开发与测试
 
 ```powershell
-# 插件服务测试：MCP 握手、tools/call、HTTP、端口冲突、stdin 关闭即退出（43 项）
+# 插件服务测试：MCP 握手、tools/call、HTTP、端口冲突、令牌热更新、stdin 关闭即退出（66 项）
 node tests/test_mcp_server.mjs
 
 # 注入脚本 DOM 自测：按钮位置、type=button、空输入、写回、还原、失败保草稿、
-# 官方 API 优先、写回全失败的信标（23 项，需要 Chrome/Edge）
+# 官方 API 优先、写回全失败的信标（31 项，需要 Chrome/Edge）
 python tools/run_dom_test.py
+
+# asar 写入层测试：在临时目录里合成小包，跑 apply / 幂等 / 刷新 / --out / restore /
+# 无基线保护 / 非法包（45 项，不碰真实安装包）
+python tests/test_patch_zcode.py
 
 # 全量逐字节校验（需先拿到原始备份）
 python tools/verify_patch.py --original "<备份>" --patched "D:\Program Files\ZCode\resources\app.asar"
 ```
 
-`web/mock_composer.html` 是仿 composer 结构的本地预览页，可直接用浏览器打开看按钮样式；
-`web/mock-selftest.js` 里的断言由 `run_dom_test.py` 在无头浏览器里执行。
+`web/mock_composer.html` 是仿 composer 结构的本地预览页，但页面引用的是
+`web/zcode-enhance.local.js`（由 `run_dom_test.py` 生成、跑完即删）。想用浏览器手动查看，
+先跑一次 `python tools/run_dom_test.py --keep` 生成该文件，再打开页面；否则脚本 404、看不到按钮。
+`web/mock-selftest.js` 里的断言同样只在无头浏览器（`run_dom_test.py`）里执行。
 
 改完 `inject/zcode-enhance.js` 或 `prompts/` 后：
 
-- 注入脚本：重新 `apply` 前先 `restore`（`apply` 是幂等的，会跳过已注入的包）；
+- 注入脚本：直接重新 `apply` 即可 —— 已注入的包会走「刷新脚本」路径，不需要先 `restore`
+  （基线被删掉也能刷新）；
 - 提示词：插件从自身目录读 `prompts/`，改完需要重装插件或直接改已安装副本，然后**重启 ZCode**。
 
 ---
@@ -701,8 +747,8 @@ ZCode 的插件机制只开放 `availability: "session"` 的侧栏面板，**没
 | 第三方解析 | npm `asar list` 能正常解析补丁后的包 |
 | 增强耗时 | 中文 2.3s / 英文 2.6s / 混排 3.8s（deepseek-flash，本机网关） |
 | 语言一致性 | 中文→中文、英文→英文、混排→自然混排，均无语言标签混入 |
-| DOM 自测 | 23 项断言全过（无头 Edge） |
-| 服务端测试 | 43 项全过 |
+| DOM 自测 | 30 项断言全过（无头 Edge） |
+| 服务端测试 | 63 项全过 |
 
 ---
 
@@ -714,6 +760,9 @@ ZCode 的插件机制只开放 `availability: "session"` 的侧栏面板，**没
   `editorApiRef` 一旦变化，需要同步更新 `inject/zcode-enhance.js`；写回失败会明确提示而不是假装成功。
 - **更新插件后必须重启 ZCode**（旧 MCP server 不会随卸载退出）。
 - **`127.0.0.1:8770` 只能有一个实例**：由插件占用，不要再起第二个服务（不随 ZCode 启停、还会抢端口）。
+- **打补丁时必须退出 ZCode**：`app.asar` 被占用时 `apply` 会明确报错并保持原文件不变
+  （不再退化成"就地覆写"，那种写法一旦中断就会留下半截 asar）。
+- **草稿上限 8000 字**：超过直接返回 `input_too_long`，不会把整段上下文发给模型。
 - **输入框必须可编辑**：正在生成回复等只读状态下不保证能写回。
 - **修改第三方安装包有风险**：本工具只做最小改动并自动校验/回滚，但仍建议先备份、
   明确知道自己在做什么再动手；因使用本工具造成的任何问题请自行承担。

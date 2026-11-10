@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import re
 import shutil
 import subprocess
@@ -37,11 +38,13 @@ def find_browser() -> str:
     raise SystemExit("找不到 Chrome/Edge，无法运行 DOM 自测")
 
 
-def prepare(endpoint: str) -> None:
+def prepare(endpoint: str, token: str = "dom-test-token") -> None:
     source = (PROJECT_DIR / "inject" / "zcode-enhance.js").read_text(encoding="utf-8")
-    if "__ZCE_ENDPOINT__" not in source:
-        raise SystemExit("注入脚本缺少 __ZCE_ENDPOINT__ 占位符")
-    LOCAL_JS.write_text(source.replace("__ZCE_ENDPOINT__", endpoint), encoding="utf-8")
+    for placeholder in ("__ZCE_ENDPOINT__", "__ZCE_TOKEN__"):
+        if placeholder not in source:
+            raise SystemExit(f"注入脚本缺少 {placeholder} 占位符")
+    source = source.replace("__ZCE_ENDPOINT__", endpoint).replace("__ZCE_TOKEN__", token)
+    LOCAL_JS.write_text(source, encoding="utf-8")
 
 
 def main() -> int:
@@ -51,46 +54,48 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true", help="保留生成的 local.js")
     args = parser.parse_args()
 
-    prepare(args.endpoint)
+    # 先找浏览器再写临时文件：否则找不到浏览器时会在 web/ 下留下一个孤儿文件
     browser = args.browser or find_browser()
     page = WEB_DIR / "mock_composer.html"
 
-    with tempfile.TemporaryDirectory() as profile:
-        cmd = [
-            browser,
-            # 实测（2026-11-10，Edge 142）：--headless=new 在这里会一直挂着不退出，
-            # 旧版 --headless 配合 --dump-dom 能正常输出并结束。
-            "--headless",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--allow-file-access-from-files",
-            f"--user-data-dir={profile}",
-            "--virtual-time-budget=6000",
-            "--dump-dom",
-            page.as_uri(),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=120)
+    try:
+        prepare(args.endpoint)
+        with tempfile.TemporaryDirectory() as profile:
+            cmd = [
+                browser,
+                # 实测（2026-11-10，Edge 142）：--headless=new 在这里会一直挂着不退出，
+                # 旧版 --headless 配合 --dump-dom 能正常输出并结束。
+                "--headless",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--allow-file-access-from-files",
+                f"--user-data-dir={profile}",
+                "--virtual-time-budget=6000",
+                "--dump-dom",
+                page.as_uri(),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=120)
 
-    dom = proc.stdout or ""
-    title = re.search(r"<title>(.*?)</title>", dom, re.S)
-    title = title.group(1).strip() if title else "(无标题)"
+        dom = proc.stdout or ""
+        title = re.search(r"<title>(.*?)</title>", dom, re.S)
+        title = title.group(1).strip() if title else "(无标题)"
 
-    body = re.search(r'<pre id="result"[^>]*>(.*?)</pre>', dom, re.S)
-    report = body.group(1).strip() if body else "(没抓到 #result，页面可能没跑起来)"
-    report = (report.replace("&lt;", "<").replace("&gt;", ">")
-                    .replace("&amp;", "&").replace("&quot;", '"'))
+        body = re.search(r'<pre id="result"[^>]*>(.*?)</pre>', dom, re.S)
+        report = body.group(1).strip() if body else "(没抓到 #result，页面可能没跑起来)"
+        report = html.unescape(report)
 
-    print(report)
-    print()
-    print(f"document.title = {title}")
-    if proc.returncode != 0:
-        print(f"浏览器退出码 {proc.returncode}")
-    if not args.keep and LOCAL_JS.exists():
-        LOCAL_JS.unlink()
+        print(report)
+        print()
+        print(f"document.title = {title}")
+        if proc.returncode != 0:
+            print(f"浏览器退出码 {proc.returncode}")
 
-    return 0 if title == "DOMTEST:PASS" else 1
+        return 0 if title == "DOMTEST:PASS" else 1
+    finally:
+        if not args.keep and LOCAL_JS.exists():
+            LOCAL_JS.unlink()
 
 
 if __name__ == "__main__":

@@ -74,10 +74,13 @@
     try { body = init && typeof init.body === 'string' ? JSON.parse(init.body) : null; } catch { /* ignore */ }
     window.__calls.push({ url, body });
 
-    // 自测模式下不真的联网，直接回一个假结果
+    // 自测模式下不真的联网，直接回一个假结果。
+    // 必须尊重 init.signal 与 __mockDelay：否则「请求途中取消」这条路径没法测。
     if (window.__mockEnhance) {
-      return Promise.resolve({
+      const response = () => ({
+        ok: true,
         status: 200,
+        text: () => Promise.resolve(''),
         json: () => Promise.resolve({
           success: true,
           text: '【增强】' + (body && body.text ? body.text : ''),
@@ -87,6 +90,16 @@
           removedMetaLines: 0,
           overLength: false,
         }),
+      });
+      const signal = init && init.signal;
+      const abortError = () => Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+      if (!window.__mockDelay && !signal) return Promise.resolve(response());
+      return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) { reject(abortError()); return; }
+        const timer = setTimeout(() => resolve(response()), window.__mockDelay || 0);
+        if (signal) {
+          signal.addEventListener('abort', () => { clearTimeout(timer); reject(abortError()); }, { once: true });
+        }
       });
     }
     return realFetch.apply(this, arguments);

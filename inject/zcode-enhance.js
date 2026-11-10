@@ -21,8 +21,12 @@
   if (window.__zceInstalled) return;
   window.__zceInstalled = true;
 
-  // 打补丁时会替换成实际端点
+  // 打补丁时会替换成实际端点与访问令牌
   const ENDPOINT = '__ZCE_ENDPOINT__';
+  // 令牌用来挡住「本机浏览器里任意网页都能调 8770」这条路：CORS 通配时任何站点
+  // 都能用用户的 key 花钱。占位符没被替换时（直接打开源文件自测）当作空令牌。
+  const RAW_TOKEN = '__ZCE_TOKEN__';
+  const TOKEN = /^__ZCE_/.test(RAW_TOKEN) ? '' : RAW_TOKEN;
 
   // 文案对齐 ZCode 自带的 chat.promptEnhance.* 与 WorkBuddy 的 input.enhance.*
   const TEXT = {
@@ -34,7 +38,7 @@
     failedWith: (e) => `提示词增强失败：${e}`,
     offline: '增强服务未响应：确认插件「增强提示词服务」已启用，且 127.0.0.1:8770 在监听',
     done: (model) => (model ? `已增强 · ${model}` : '已增强'),
-    overLength: '结果超过 800 字，可再点一次让模型收敛',
+    overLength: (max) => `结果超过 ${max || 800} 字，可再点一次让模型收敛`,
     writeBackFailed: '已生成增强结果，但写回输入框失败（编辑器结构可能已变）',
   };
 
@@ -51,6 +55,11 @@
   const BEACON_RETRY_MS = 3000;
   const BEACON_MAX_TRIES = 20;
 
+  // 每次页面加载生成一个会话 id。诊断工具靠它把「本次启动」的信标和上次启动分开：
+  // 同一份 index.html 每次启动的 url 完全一样，只按 url 划分会把上次的 attached
+  // 也算进来，于是"按钮没出现"被误判成"已挂上"（实测踩过）。
+  const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
   /**
    * 诊断信标：把「脚本是否加载、有没有找到 composer、锚点是否命中」回报给插件服务。
    *
@@ -60,7 +69,14 @@
    * 成功即停；上报失败本身不影响增强功能。
    */
   function beacon(stage, extra, attempt = 1) {
-    const payload = JSON.stringify({ stage, url: location.href, ts: Date.now(), ...(extra || {}) });
+    // 诊断关键字段放在展开之后：extra 里将来若出现同名键，不能覆盖掉会话与时间
+    const payload = JSON.stringify({
+      ...(extra || {}),
+      stage,
+      url: location.href,
+      session: SESSION_ID,
+      ts: Date.now(),
+    });
 
     const retry = () => {
       if (attempt >= BEACON_MAX_TRIES) return;
@@ -86,6 +102,11 @@
   // ---------------------------------------------------------------- 模型探测
   // ZCode 发请求时会把真实 model id 放进 body，抓它最准；DOM 标签只是显示名，作次选。
   let lastRequestModel = '';
+  let lastRequestAt = 0;
+  let lastModelLabel = '';
+  // 只在 body 头部找 model 字段：整包 JSON.parse 会把几百 KB 的上下文在主线程上
+  // 同步解析一遍，而 model 永远在最前面。
+  const MODEL_RE = /"model"\s*:\s*"([^"\\]{1,120})"/;
   (() => {
     const originalFetch = window.fetch;
     if (typeof originalFetch !== 'function') return;
@@ -94,9 +115,10 @@
         const url = typeof input === 'string' ? input : (input && input.url) || '';
         const body = init && typeof init.body === 'string' ? init.body : null;
         if (body && /chat\/completions|completions|\/messages/.test(url)) {
-          const parsed = JSON.parse(body);
-          if (parsed && typeof parsed.model === 'string' && parsed.model.trim()) {
-            lastRequestModel = parsed.model.trim();
+          const hit = MODEL_RE.exec(body.slice(0, 8192));
+          if (hit) {
+            lastRequestModel = hit[1].trim();
+            lastRequestAt = Date.now();
           }
         }
       } catch {
@@ -105,6 +127,10 @@
       return originalFetch.apply(this, arguments);
     };
   })();
+
+  // 抓到的 model 有保鲜期，且用户切换模型后要立刻让位给界面标签：
+  // 否则「切了模型但还没发过消息」时，第一次增强会用上一个模型。
+  const MODEL_CAPTURE_TTL_MS = 10 * 60_000;
 
   function currentModel() {
     let label = '';
@@ -116,7 +142,15 @@
     }
     // 可能是 "DeepSeek-V4.1-Flash · 经济模式" 这类复合文案，取首段
     label = label.split(/[·|｜]/)[0].trim();
-    return lastRequestModel || label || '';
+
+    if (label && label !== lastModelLabel) {
+      // 只有「从一个标签变成另一个」才算用户切换了模型；
+      // 第一次读到标签（lastModelLabel 还是空）不能把刚抓到的 id 作废。
+      if (lastModelLabel) lastRequestModel = '';
+      lastModelLabel = label;
+    }
+    const fresh = lastRequestModel && Date.now() - lastRequestAt < MODEL_CAPTURE_TTL_MS;
+    return (fresh ? lastRequestModel : '') || label || '';
   }
 
   // ---------------------------------------------------------------- 编辑器读写
@@ -342,20 +376,40 @@
     }
   }
 
+  /**
+   * 按钮内容只用 DOM API 拼，不拼 innerHTML：
+   * 现在虽然全是常量，但这条路径以后一旦插进变量就是一个 XSS 口子。
+   * 用 dataset 记「当前渲染的是哪一态」，避免无谓重建（重建会触发观察器）。
+   */
+  function renderButton(st) {
+    const button = st.button;
+    const state = st.loading ? 'busy' : 'idle';
+    if (button.dataset.zceRender === state) return;
+
+    button.textContent = '';
+    const icon = document.createElement('span');
+    if (st.loading) {
+      icon.className = 'zce-spin';
+    } else {
+      icon.className = 'zce-icon';
+      icon.textContent = '✨';
+    }
+    const label = document.createElement('span');
+    label.className = 'zce-label';
+    label.textContent = st.loading ? TEXT.busy : TEXT.idle;
+    button.append(icon, label);
+
+    button.dataset.zceRender = state;
+    button.setAttribute('aria-label', st.loading ? TEXT.busy : TEXT.idle);
+  }
+
   function render(st) {
     if (!st.button) return;
     if (st.button.disabled !== st.loading) st.button.disabled = st.loading;
     const active = st.loading ? 'true' : 'false';
     if (st.button.dataset.active !== active) st.button.dataset.active = active;
 
-    const html = st.loading
-      ? `<span class="zce-spin"></span><span class="zce-label">${TEXT.busy}</span>`
-      : `<span class="zce-icon">✨</span><span class="zce-label">${TEXT.idle}</span>`;
-    // 与「当前真实 DOM」比较，而不是记一个 lastHtml：按钮被重建时也能立刻写对内容，
-    // 且写完后二者相等，不会再触发观察器。
-    if (st.button.innerHTML !== html) {
-      st.button.innerHTML = html;
-    }
+    renderButton(st);
 
     const tip = st.loading ? '再次点击可取消当前这次增强' : `${TEXT.idle}（Ctrl+Shift+E）`;
     if (st.button.title !== tip) st.button.title = tip;
@@ -364,6 +418,36 @@
       setHidden(st.revert, !(st.original !== null && !st.loading));
       setText(st.revert, TEXT.revert);
       if (st.revert.title !== '恢复到增强前的原文') st.revert.title = '恢复到增强前的原文';
+    }
+  }
+
+  /** 组请求头：令牌只在补丁替换过占位符时才带。 */
+  function apiHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (TOKEN) headers['X-ZCE-Token'] = TOKEN;
+    return headers;
+  }
+
+  /**
+   * 读响应体：HTTP 非 2xx / 非 JSON 都要给出可读原因。
+   * 不先判状态码的话，反向代理返回的 HTML 错误页会变成
+   * "Unexpected token '<' ..." 这种对用户毫无意义的报错。
+   */
+  async function readJsonResponse(resp) {
+    if (!resp) throw new Error('没有收到响应');
+    if (resp.ok === false || resp.status >= 400) {
+      let detail = '';
+      try {
+        detail = String(await resp.text()).slice(0, 120);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`HTTP ${resp.status}${detail ? `：${detail}` : ''}`);
+    }
+    try {
+      return await resp.json();
+    } catch {
+      throw new Error('服务返回的不是 JSON（可能有别的程序占用了端点）');
     }
   }
 
@@ -376,19 +460,32 @@
       return;
     }
 
-    st.controller = new AbortController();
+    // 每次运行带一个身份：写回是异步的（setText/execCommand 后还有两个 tick），
+    // 期间用户可能已经取消或发起了新的一次，旧运行不能再改界面和草稿。
+    const runId = Symbol('enhance-run');
+    const controller = new AbortController();
+    st.runId = runId;
+    st.controller = controller;
     st.loading = true;
     setStatus(st, TEXT.busy);
     render(st);
 
+    // 已被取消时不要停在「增强中…」；被新一次运行接管时则不要碰界面
+    const stopIfDead = () => {
+      if (st.runId === runId && !controller.signal.aborted) return false;
+      if (st.runId === runId) setStatus(st, TEXT.cancelled);
+      return true;
+    };
+
     try {
       const resp = await fetch(`${ENDPOINT}/api/enhance`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: apiHeaders(),
         body: JSON.stringify({ text: draft, model: currentModel() || undefined }),
-        signal: st.controller.signal,
+        signal: controller.signal,
       });
-      const data = await resp.json();
+      const data = await readJsonResponse(resp);
+      if (stopIfDead()) return;
 
       if (!data || data.success !== true || !String(data.text || '').trim()) {
         // 失败：保留草稿，只提示原因
@@ -399,6 +496,7 @@
 
       const snapshot = draft;
       const wrote = await writeDraft(editor, data.text);
+      if (st.runId !== runId) return; // 已被新一次运行接管，什么都不动
       if (!wrote.ok) {
         // 失败详情走信标，否则「写回失败」这四个字对排查毫无帮助
         beacon('write-failed', wrote);
@@ -407,11 +505,18 @@
       }
       beacon('write-ok', { strategy: wrote.strategy, hasApi: wrote.hasApi });
 
+      // 内容已经被改了，快照必须记下来 —— 即使这次运行刚刚被取消，
+      // 也得给用户留一条「还原原文」的退路。
       st.original = snapshot;
+      st.enhanced = data.text;
+      if (controller.signal.aborted) {
+        setStatus(st, `${TEXT.cancelled} · 结果已写入，可点「还原原文」`);
+        return;
+      }
       const bits = [TEXT.done(data.model)];
       if (data.channel && data.channel !== 'zcode') bits.push(`通道 ${data.channel}`);
       if (data.removedMetaLines) bits.push(`清理 ${data.removedMetaLines} 行元信息`);
-      if (data.overLength) bits.push(TEXT.overLength);
+      if (data.overLength) bits.push(TEXT.overLength(data.maxLength));
       setStatus(st, bits.join(' · '), data.overLength ? 'warn' : undefined);
     } catch (err) {
       if (err && err.name === 'AbortError') {
@@ -423,9 +528,12 @@
         setStatus(st, TEXT.failedWith(err && err.message ? err.message : String(err)), 'error');
       }
     } finally {
-      st.loading = false;
-      st.controller = null;
-      render(st);
+      // 只有「自己还是当前这次运行」时才收尾，否则会把新一次运行的状态清掉
+      if (st.runId === runId) {
+        st.loading = false;
+        st.controller = null;
+        render(st);
+      }
     }
   }
 
@@ -447,6 +555,8 @@
     const status = document.createElement('span');
     status.className = 'zce-status';
     status.dataset.zceStatus = 'true';
+    // 状态变化（增强中/失败/已增强）对读屏用户也要可见
+    status.setAttribute('aria-live', 'polite');
 
     wrap.append(button, revert, status);
     actions.appendChild(wrap);
@@ -475,6 +585,7 @@
         return;
       }
       st.original = null; // 清空快照，允许基于当前内容再次增强
+      st.enhanced = '';
       setStatus(st, '已还原原文');
       render(st);
     });
@@ -524,22 +635,53 @@
         status: null,
         loading: false,
         original: null,
+        enhanced: '',
         controller: null,
+        runId: null,
+        inputTimer: null,
+        observer: null,
       };
       states.set(composer, st);
 
-      // 每个 composer 只绑一次：DOM 变了只重建 UI，不重复挂监听
-      const composerObserver = new MutationObserver(() => {
-        try {
-          ensureUI(st);
-        } catch (err) {
-          console.warn('[zce] 重建按钮失败', err);
-        }
-      });
+      // 每个 composer 只绑一次：DOM 变了只重建 UI，不重复挂监听。
+      // 16ms 节流：Lexical 每敲一个字都会产生一串 childList 变更，
+      // 逐个跑 ensureUI 等于每个按键都查一遍 DOM。
+      let ensureScheduled = false;
+      const scheduleEnsure = () => {
+        if (ensureScheduled) return;
+        ensureScheduled = true;
+        setTimeout(() => {
+          ensureScheduled = false;
+          try {
+            ensureUI(st);
+          } catch (err) {
+            console.warn('[zce] 重建按钮失败', err);
+          }
+        }, 16);
+      };
+      const composerObserver = new MutationObserver(scheduleEnsure);
       composerObserver.observe(composer, { childList: true, subtree: true });
+      // 显式挂到状态上：观察中的 observer 本来就不会被回收，这里存一份只是为了
+      // 调试时能确认"这个 composer 的观察器还在"，别当成无用字段删掉。
       st.observer = composerObserver;
 
       composer.addEventListener('keydown', (event) => onKeydown(st, event), true);
+
+      // 草稿被改动后，增强前快照就失效了：否则用户改完再点「还原原文」，
+      // 会把刚写的内容整个覆盖掉，而界面上看不出会发生什么。
+      composer.addEventListener('input', () => {
+        if (st.original === null) return;
+        clearTimeout(st.inputTimer);
+        st.inputTimer = setTimeout(() => {
+          st.inputTimer = null;
+          if (st.original === null) return;
+          const now = readDraft(findEditor(st.composer));
+          if (normalize(now) === normalize(st.enhanced || '')) return;
+          st.original = null;
+          st.enhanced = '';
+          render(st);
+        }, 300);
+      }, true);
 
       // 首次接手时上报诊断，便于判断按钮到底卡在哪一步
       beacon('composer-seen', {
@@ -600,7 +742,7 @@
   });
 
   function boot() {
-    ensureStyle();
+    // 样式表由 scan() → ensureStyle() 负责（带 id 去重），这里不重复调用
     scan();
     rootObserver.observe(document.documentElement, { childList: true, subtree: true });
     beacon('boot', {
