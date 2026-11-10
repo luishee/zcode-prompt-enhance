@@ -439,7 +439,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `python tools/patch_zcode.py apply` | 注入（**幂等**：已注入会跳过）；升级后跑这条 |
 | `python tools/patch_zcode.py status` | 查看注入状态与备份位置 |
 | `python tools/patch_zcode.py restore` | 回滚到基线备份 |
-| `python tools/patch_zcode.py verify` | 读回校验 + 抽样比对 |
+| `python tools/patch_zcode.py verify` | 读回校验 + 抽样比对（没有基线备份时跳过抽样） |
 | `python tools/patch_zcode.py --dry-run apply` | 演练：写到 `<asar>.dryrun`，不动原文件、不写状态 |
 | `python tools/verify_patch.py --original <备份> --patched <asar>` | 全量逐字节校验（实测约 3.18 万文件） |
 | `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步 |
@@ -515,6 +515,10 @@ python "<项目目录>\tools\patch_zcode.py" restore
 ```
 
 或双击 `.bat` 选 `4`（会要求输入 `y` 确认）。还原后完全重启 ZCode，按钮消失。
+
+> **基线备份被删除过时**：`restore` 需要注入前的原始包，`status` 会显示 `备份: 已被删除（无回滚基线）`。
+> 这时 `restore` 不可用，补救办法是：修复安装 / 重装 ZCode（会重装 `resources/`，等效回到原始状态），
+> 或等下次 ZCode 升级后执行 `apply`（那时会自动建立新的基线）。备份约 374MB，删掉能省空间但会失去回滚能力。
 
 **彻底卸载：**
 
