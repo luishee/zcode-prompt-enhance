@@ -1,0 +1,3 @@
+# 统一换行：源码用 LF，批处理必须是 CRLF（否则 cmd 的 goto/label 解析可能出问题）
+* text=auto eol=lf
+*.bat text eol=crlf

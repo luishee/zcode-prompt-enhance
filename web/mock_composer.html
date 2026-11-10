@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ZCode 增强提示词 · 本地预览与自测</title>
+<style>
+  body { margin: 0; padding: 24px; background: #f5f6f8; font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif; color: #1f2329; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  p.note { color: #8a919e; font-size: 12px; margin: 0 0 16px; }
+  .stage { max-width: 720px; }
+  /* 下面这段刻意模仿 ZCode composer 的类名与布局 */
+  form { margin: 0; }
+  [data-composer-layout] {
+    display: flex; flex-direction: column; gap: 12px;
+    padding: 12px; background: #fff;
+    border: 1px solid #dfe2e8; border-radius: 16px;
+    box-shadow: 0 4px 16px rgba(16,24,40,.05);
+  }
+  .editor {
+    min-height: 66px; padding: 6px 2px; outline: none; white-space: pre-wrap; word-break: break-word;
+  }
+  .editor:empty::before { content: attr(data-placeholder); color: #a8aeb9; }
+  .toolbar { display: flex; align-items: flex-end; gap: 12px; }
+  [data-composer-leading-actions] { display: flex; min-width: 0; flex: 1; align-items: center; }
+  [data-composer-leading-content] { display: flex; flex-shrink: 0; align-items: center; gap: 4px; }
+  .chip {
+    height: 26px; padding: 0 9px; display: inline-flex; align-items: center;
+    font-size: 12px; color: #5b6270; border: 1px solid #dfe2e8; border-radius: 999px; background: #fff;
+  }
+  [data-composer-trailing-actions] button {
+    height: 28px; padding: 0 14px; font-size: 12px; color: #fff; background: #2f6fed;
+    border: 0; border-radius: 999px; cursor: pointer;
+  }
+  #result {
+    margin-top: 20px; padding: 12px; background: #fff; border: 1px solid #dfe2e8;
+    border-radius: 8px; font: 12px/1.7 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+  }
+  .ok { color: #18794e; } .bad { color: #d64545; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <h1>ZCode 增强提示词 · 本地预览</h1>
+  <p class="note">这段 DOM 照抄 ZCode composer 的结构（data-composer-layout / leading-actions / lexical 编辑器），
+     用来在不打补丁的前提下验证按钮与交互。</p>
+
+  <form id="theForm">
+    <div data-composer-layout>
+      <div class="editor" id="editor" data-lexical-editor="true" contenteditable="true"
+           data-placeholder="随便写一句草稿，然后点下面的增强按钮"></div>
+      <div class="toolbar">
+        <div data-composer-leading-actions>
+          <div data-composer-leading-content>
+            <button type="button" class="chip">＋</button>
+            <span class="chip" data-composer-open-label>DeepSeek-V4.1-Flash</span>
+          </div>
+        </div>
+        <div data-composer-trailing-actions><button type="submit">发送</button></div>
+      </div>
+    </div>
+  </form>
+
+  <pre id="result">（自测结果会写在这里）</pre>
+</div>
+
+<!-- 必须在注入脚本之前安装 fetch 桩：注入脚本在加载时就会包一层 window.fetch，
+     如果之后才装桩，它会继续调用真正的 fetch，桩就失效了。 -->
+<script>
+  window.__calls = [];
+  const realFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    let body = null;
+    try { body = init && typeof init.body === 'string' ? JSON.parse(init.body) : null; } catch { /* ignore */ }
+    window.__calls.push({ url, body });
+
+    // 自测模式下不真的联网，直接回一个假结果
+    if (window.__mockEnhance) {
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({
+          success: true,
+          text: '【增强】' + (body && body.text ? body.text : ''),
+          original: body && body.text,
+          model: body && body.model,
+          channel: 'zcode',
+          removedMetaLines: 0,
+          overLength: false,
+        }),
+      });
+    }
+    return realFetch.apply(this, arguments);
+  };
+  window.__mockEnhance = true;
+</script>
+
+<script src="./zcode-enhance.local.js"></script>
+<script src="./mock-selftest.js"></script>
+</body>
+</html>
