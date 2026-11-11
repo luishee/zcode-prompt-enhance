@@ -39,7 +39,7 @@ if not exist "%~dp0tools\menu.py" (
   goto :fail
 )
 if not defined PY (
-  echo 找不到可用的 Python 3。请安装 Python 3.9+ 并勾选 "Add python.exe to PATH"；
+  echo 找不到可用的 Python 3.10+。请勾选 "Add python.exe to PATH"；
   echo 若已从 Microsoft Store 安装，请在“应用执行别名”里启用 python.exe。
   echo 也可以手动运行：py -3 tools\menu.py
   goto :fail

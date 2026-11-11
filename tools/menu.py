@@ -105,6 +105,13 @@ def do_apply() -> int:
         print("  - 权限被拒：用“以管理员身份运行”再试一次")
         return rc
 
+    # 演练/输出模式不改原 app.asar，所以不能说“补丁已写入、请重启 ZCode”——
+    # 那会把人引到“已经生效了怎么没按钮”的错误结论上去。产物路径由上面那段输出给出。
+    if "--dry-run" in FORWARD or "--out" in FORWARD:
+        print("[完成] 演练/输出模式：原 app.asar 没有被改动，不需要重启 ZCode；")
+        print("       请检查上面输出的产物路径，确认无误后再去掉 --dry-run / --out 正式执行。")
+        return 0
+
     if running:
         print("[完成] 补丁已写入，但必须完全退出 ZCode 再重新打开才会生效。")
         print("       注意托盘图标也要退出，否则进程还在，等于没重启。")

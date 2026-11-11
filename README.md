@@ -12,7 +12,7 @@
 └──────────────────────────────────────────────────────┘
 ```
 
-> **平台**：Windows 10/11。实测环境 ZCode 3.17.2 + Python 3.15 + Node 24。
+> **平台**：Windows 10/11。实测环境 ZCode 3.18.0 + Python 3.15 + Node 24。
 > 注入层需要改 ZCode 的 `app.asar`，每次 ZCode 升级后要重新注入一次（一条命令 / 双击 `.bat` 选 1）。
 
 ## 快速开始（3 步）
@@ -377,8 +377,12 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 - 检查按钮是否真的挂上了（读诊断信标）；
 - 还原到注入前的原始 `app.asar`。
 
-它自身只有十几行 ASCII，真正的菜单与文案在 `tools/menu.py`（原因见文末「为什么 `.bat` 这么薄」）。
-`.bat` 用 `cd /d "%~dp0"` 定位自身目录，所以**放在哪、从哪里双击都能跑，不需要先 `cd`**。
+它自身只保留 ASCII 逻辑 + 两行必要的中文提示，真正的菜单与文案在 `tools/menu.py`（原因见文末「为什么 `.bat` 这么薄」）。
+文件必须保存为 **UTF-8（无 BOM）+ CRLF 换行**：加 BOM 会让首行 `@echo off` 失效、之后每行命令都被回显；
+另存为 GBK/ANSI 会让中文提示在 `chcp 65001` 下变乱码；改成 LF 会破坏 `goto`/标签解析。
+`.gitattributes` 只锁得住换行、锁不住编码，所以这几条约定由 `tests/test_entry_bat.py` 守着。
+`.bat` 用 `pushd "%~dp0"` 定位自身目录，所以**放在哪、从哪里双击都能跑，不需要先 `cd`**
+（UNC 路径下 `cd /d` 会失败并静默留在原目录，`pushd` 会临时映射盘符）。
 
 ### 双击使用（交互模式）
 
@@ -415,8 +419,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 修复增强提示词按钮.bat status     :: 查看状态
 修复增强提示词按钮.bat check      :: 读信标检查按钮
 修复增强提示词按钮.bat restore    :: 还原（仍会要求输入 y）
+修复增强提示词按钮.bat -h         :: 显示用法
 
-:: 指定非默认安装位置 / 端点（选项写在动作之后）
+:: 指定非默认安装位置 / 端点（选项写在动作之后也可以）
 修复增强提示词按钮.bat apply --asar "E:\Apps\ZCode\resources\app.asar"
 ```
 
@@ -424,26 +429,35 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 - `--asar` / `--backup` / `--endpoint` / `--out` 会被搬运给 `patch_zcode.py`
   （`patch_zcode` 要求选项在子命令之前，`menu.py` 负责摆正顺序）；
   `--force` / `--full-verify` / `--dry-run` 三个开关同样可以透传；
-- **退出码**：`0` 成功；`1` 执行失败（如权限被拒、找不到备份）；`2` 参数不认识；
+- 参数写错一律**立刻报错**（`未知参数：… / 多给了动作：… / 需要一个值`）而不是被当成没看见——
+  参数写了没生效却"看起来成功了"是自动化里最难查的一类问题；
+- **退出码**：`0` 成功；`1` 缺依赖或执行失败（找不到 Python 3、缺 `tools\menu.py`、权限被拒、找不到备份）；`2` 参数不对；
 - 只有**失败时**窗口才会 `pause` 停住（方便看报错），成功时执行完直接关闭——适合放进脚本/任务计划；
-- 还原若要全自动，用 `echo y | 修复增强提示词按钮.bat restore`；
+  要接无人值守的自动化，可先 `set ZCE_NO_PAUSE=1`，失败也不停；
+- 还原若要全自动，用 `echo y | 修复增强提示词按钮.bat restore`；stdin 空着（`<nul`）时会当成「已取消」而不是抛异常；
 - 带空格或中文的路径直接用引号包起来即可。
 
 ### 注意事项
 
 | 事项 | 说明 |
 | --- | --- |
-| Python 必须在 `PATH` | `.bat` 调用的是 `python`。提示 `'python' 不是内部或外部命令` 就是没装或没加进 PATH |
+| 自己找解释器 | `.bat` 先试 `%SystemRoot%\py.exe -3`，再试 `PATH` 里的 `python.exe`，都会**真的跑一次** `import sys` 才算数：Microsoft Store 的「应用执行别名」占位符能骗过 `where`、骗不过这一步；两者都没有时给出安装提示并退出 `1` |
+| `tools/` 必须一起在 | `.bat` 只是薄壳，正文是 `tools/menu.py`；只拷 `.bat` 会提示「脚本不完整」并退出 `1` |
 | 一般不需要管理员权限 | 只有 `apply` 报「权限被拒 / `PermissionError`」时，右键 **以管理员身份运行** |
 | 不要只关窗口不关 ZCode | 补丁在 ZCode 启动时加载，必须把 ZCode **完全退出**（托盘也要退）再启动 |
 | 运行日志 | 菜单输出在控制台；诊断信标在 `%LOCALAPPDATA%\zcode-prompt-enhance\beacon.log` |
 | 不要重复起服务 | `8770` 由插件占用，起第二个实例只会抢端口、让"谁在服务"更难判断 |
+| 别在已有 cmd 窗口里改代码页 | `chcp 65001` 与 `title` 作用于整个控制台、`exit /b` 不会还原；双击运行的窗口随脚本关闭，无影响 |
 
 ### 为什么 `.bat` 这么薄
 
 实测（2026-11-10）：cmd.exe 按固定大小缓冲分块读取批处理文件，UTF-8 汉字一旦跨过缓冲边界就被截断，
 同一行中文 `echo …` **有时正常、有时被当成命令执行**并报「不是内部或外部命令」——间歇性、不可预测。
 把中文界面交给 Python（配合 `.bat` 里的 `chcp 65001`）后完全稳定，所以 `.bat` 只保留 ASCII 的转发逻辑。
+
+因此往 `.bat` 里加中文是**要付代价**的：目前只留了「找不到 Python」「脚本不完整」这两处
+（它们必须在解释器跑起来之前显示，无法交给 `menu.py`），并用 `tests/test_entry_bat.py` 断言
+「非 ASCII 只出现在 `echo` 行」把这些约定钉住。
 
 ---
 
@@ -463,7 +477,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 31 项 DOM 断言 |
 | `node tests/test_mcp_server.mjs` | 插件服务测试（66 项，含生命周期、端口冲突、令牌热更新） |
 | `python tests/test_patch_zcode.py` | asar 写入层测试（45 项：apply/幂等/刷新/还原/无基线保护） |
-| `python tools/menu.py [apply\|status\|check\|restore]` | `.bat` 的实际实现，也可直接调 |
+| `python tests/test_entry_bat.py` | 入口 `.bat` 契约测试（34 项：编码/换行约定、退出码、参数透传与演练文案，不碰 ZCode） |
+| `python tools/menu.py [apply\|status\|check\|restore]` | `.bat` 的实际实现，也可直接调（`-h` 看用法） |
 
 `--asar` / `--backup` / `--endpoint` 三个选项可以透传给 `.bat`（写在动作之后，选项在子命令之前）：
 
@@ -649,7 +664,8 @@ zcode-prompt-enhance/
 │   └─ menu.py                     维护菜单（.bat 的实际内容）
 ├─ tests/
 │   ├─ test_mcp_server.mjs         插件服务测试（66 项，含生命周期与令牌热更新）
-│   └─ test_patch_zcode.py         asar 写入层测试（45 项，用合成小包）
+│   ├─ test_patch_zcode.py         asar 写入层测试（45 项，用合成小包）
+│   └─ test_entry_bat.py           入口 .bat 契约测试（编码/换行、退出码、参数转发）
 ├─ web/                            本地预览页 + DOM 自测用页面
 ├─ 修复增强提示词按钮.bat          维护入口（双击运行：注入/状态/检查/还原）
 ├─ .env.example                    通道 B 环境变量参考（不会被自动加载）
@@ -671,6 +687,11 @@ python tools/run_dom_test.py
 # asar 写入层测试：在临时目录里合成小包，跑 apply / 幂等 / 刷新 / --out / restore /
 # 无基线保护 / 非法包（45 项，不碰真实安装包）
 python tests/test_patch_zcode.py
+
+# 入口 .bat 契约测试：UTF-8 无 BOM / 仅 CRLF / 非 ASCII 只在 echo 行、退出码 0/1/2、
+# 参数写错必须报错而不是被静默丢弃、选项真的搬到 patch_zcode、演练文案不说“已写入”、
+# restore 遇关闭的 stdin 当作取消（34 项，不碰 ZCode、不联网）
+python tests/test_entry_bat.py
 
 # 全量逐字节校验（需先拿到原始备份）
 python tools/verify_patch.py --original "<备份>" --patched "D:\Program Files\ZCode\resources\app.asar"

@@ -7,9 +7,11 @@
    有时正常、有时被当成命令执行」（实测：加了 BOM 会报 `'锘緻echo' 不是内部或
    外部命令` 且 `@echo off` 失效、整段命令被回显；另存为 GBK 则 chcp 65001 下中文
    全乱）。约定写进断言比写进文档靠人记可靠。
-2. `.bat` 的退出码语义（`0` 成功 / `1` 缺依赖 / `2` 参数不对，且**只有失败才 pause**）
-   是自动化依赖的契约。其中「多余参数必须报错」是 2026-11-11 修掉的静默失败：
-   老写法会丢掉 `--asar`，让 `apply` 照着**默认路径**执行，参数写了没生效却毫无提示。
+2. 退出码语义（`0` 成功 / `1` 缺依赖或执行失败 / `2` 参数不对，且**只有失败才 pause**）
+   是自动化依赖的契约。其中「参数写错必须报错」值得单独钉住：早先的 `menu.py` 只看
+   `sys.argv[1]`，`apply --asar E:\别的\app.asar` 会把 `--asar` 丢掉、照着**默认路径**
+   真的去写 asar——参数写了没生效，退出码还是 0（2026-11-11 修）。
+   现在选项由 `menu.py` 摆正顺序后透传给 `patch_zcode.py`，用法错误统一返回 2。
 
 用法：
     python tests/test_entry_bat.py
@@ -26,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 BAT = ROOT / "修复增强提示词按钮.bat"
 MENU = ROOT / "tools" / "menu.py"
+MISSING_ASAR = ROOT / "build" / "不存在的包.asar"  # 只用来测参数透传，不写任何东西
 
 FAILED = 0
 TOTAL = 0
@@ -93,11 +96,11 @@ def test_bat_file() -> None:
     check("无 BOM（有 BOM 会让首行 @echo off 失效）", not raw.startswith(b"\xef\xbb\xbf"))
     try:
         text = raw.decode("utf-8")
-        ok_utf8 = True
+        utf8_ok = True
     except UnicodeDecodeError as exc:
-        text, ok_utf8 = "", False
+        text, utf8_ok = "", False
         check("内容可按 UTF-8 解码", False, str(exc))
-    if ok_utf8:
+    if utf8_ok:
         check("内容可按 UTF-8 解码", True)
 
     check("仅 CRLF（LF 会破坏 goto/label 解析）", raw.replace(b"\r\n", b"").count(b"\n") == 0)
@@ -124,17 +127,28 @@ def test_menu_cli() -> None:
         check(f"{arg} → 退出码 0 且有用法", rc == 0 and "用法：" in out, f"rc={rc} out={out[:120]!r}")
 
     rc, out = run_menu("bogus")
-    check("未知动作 → 退出码 2", rc == 2 and "未知参数" in out, f"rc={rc} out={out[:120]!r}")
+    check("未知动作 → 退出码 2", rc == 2 and "未知动作" in out, f"rc={rc} out={out[:120]!r}")
 
     rc, out = run_menu("apply", "extra")
     check(
-        "多余参数 → 退出码 2 且没有真的执行 apply（静默丢弃的回归判据）",
-        rc == 2 and "多给了参数" in out and "[1/2]" not in out,
+        "多给一个动作 → 退出码 2 且没有真的执行 apply（静默丢弃的回归判据）",
+        rc == 2 and "多给了动作" in out and "[1/2]" not in out,
         f"rc={rc} out={out[:160]!r}",
     )
 
+    rc, out = run_menu("apply", "--bogus")
+    check("不认识的选项 → 退出码 2（写错要立刻报错）", rc == 2 and "未知参数" in out,
+          f"rc={rc} out={out[:160]!r}")
+
+    rc, out = run_menu("--asar")
+    check("选项缺值 → 退出码 2", rc == 2 and "需要一个值" in out, f"rc={rc} out={out[:160]!r}")
+
+    rc, out = run_menu("--force=1")
+    check("开关被赋了值 → 退出码 2", rc == 2 and "不接受值" in out, f"rc={rc} out={out[:160]!r}")
+
     rc, out = run_menu("--asar", "X")
-    check("单独给选项（漏了动作）→ 退出码 2", rc == 2, f"rc={rc} out={out[:120]!r}")
+    check("给了选项却没给动作 → 退出码 2", rc == 2 and "请同时指定动作" in out,
+          f"rc={rc} out={out[:160]!r}")
 
     rc, out = run_menu("restore")
     check(
@@ -144,8 +158,26 @@ def test_menu_cli() -> None:
     )
 
 
+def test_option_forwarding() -> None:
+    """选项必须真被搬到 patch_zcode.py，而不是“接受但忽略”。
+
+    判据：`--asar <不存在的包> status` 应该**进入** patch_zcode 并报错（rc 1），
+    而不是被当成用法错误（rc 2），更不是照默认路径去读真实安装包（rc 0 + 真实状态输出）。
+    """
+    print("\n[3] 选项透传（--asar 真的被搬过去了吗）")
+    rc, out = run_menu("--asar", str(MISSING_ASAR), "status")
+    check("选项在前 → 交给 patch_zcode 处理（rc 1，不是用法错误 2）", rc == 1,
+          f"rc={rc} out={out[:200]!r}")
+    check("报的是“找不到包”而不是真实安装包的状态", "找不到" in out and "当前状态" not in out,
+          f"out={out[:200]!r}")
+
+    rc2, out2 = run_menu("status", "--asar", str(MISSING_ASAR))
+    check("选项在后 → 与在前等价（menu.py 负责摆正顺序）", rc2 == rc and "找不到" in out2,
+          f"rc={rc2} out={out2[:200]!r}")
+
+
 def test_bat_end_to_end() -> None:
-    print("\n[3] .bat 端到端（退出码 + 不因 pause 卡住）")
+    print("\n[4] .bat 端到端（退出码 + 不因 pause 卡住）")
     if os.name != "nt":
         check("跳过：非 Windows", True)
         return
@@ -157,24 +189,66 @@ def test_bat_end_to_end() -> None:
         check("-h 成功时不 pause", "Press any key" not in out and "请按任意键" not in out)
 
         rc, out = run_bat("bogus")
-        check("未知动作 → 退出码 2", rc == 2 and "未知参数" in out, f"rc={rc} out={out[:160]!r}")
+        check("未知动作 → 退出码 2", rc == 2 and "未知动作" in out, f"rc={rc} out={out[:160]!r}")
         check("失败时 pause 被 ZCE_NO_PAUSE 抑制", "Press any key" not in out)
 
-        rc, out = run_bat("apply", "--asar", str(ROOT / "不存在的包.asar"))
-        check(
-            "缺 tools/menu.py 之外的用法错误 → 退出码 2（参数没被静默忽略）",
-            rc == 2 and "多给了参数" in out,
-            f"rc={rc} out={out[:200]!r}",
-        )
+        rc, out = run_bat("apply", "--bogus")
+        check("参数写错 → 退出码 2（不会被静默忽略）", rc == 2 and "未知参数" in out,
+              f"rc={rc} out={out[:200]!r}")
+
+        rc, out = run_bat("--asar", str(MISSING_ASAR), "status")
+        check("选项经 .bat → menu.py → patch_zcode 一路送到（rc 1）", rc == 1 and "找不到" in out,
+              f"rc={rc} out={out[:200]!r}")
     finally:
         set_console_cp(old)
+
+
+def test_dryrun_summary() -> None:
+    """演练/输出模式的结论文案不能和真实写入混为一谈。
+
+    实测：`apply --dry-run`（经 .bat 透传）跑完，`menu.py` 仍然打印
+    「[完成] 补丁已写入，但必须完全退出 ZCode…」——参数确实送到了 patch_zcode
+    （上面那段会显示演练模式），但总结文案会把人引到「已经写入了」的错误结论。
+    这里不碰真实安装包：只把 run_patch 换成一个返回 0 的桩。
+    """
+    print("\n[5] 演练/输出模式的结论文案")
+    import contextlib
+    import io
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    try:
+        import menu  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover
+        check("能导入 tools/menu.py", False, str(exc))
+        return
+
+    saved = (menu.run_patch, menu.zcode_running, list(menu.FORWARD))
+    menu.run_patch = lambda *a: 0
+    menu.zcode_running = lambda: False
+    try:
+        for flag in ("--dry-run", "--out"):
+            menu.FORWARD[:] = [flag, "X"]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = menu.do_apply()
+            out = buf.getvalue()
+            check(
+                f"apply {flag} → rc 0 且说明“原包未被改动、不用重启”",
+                rc == 0 and "原 app.asar 没有被改动" in out and "必须完全退出 ZCode" not in out,
+                f"rc={rc} out={out[-160:]!r}",
+            )
+    finally:
+        menu.run_patch, menu.zcode_running, fwd = saved
+        menu.FORWARD[:] = fwd
 
 
 def main() -> int:
     print(f"入口 .bat 契约测试：{BAT}")
     test_bat_file()
     test_menu_cli()
+    test_option_forwarding()
     test_bat_end_to_end()
+    test_dryrun_summary()
 
     print(f"\n{TOTAL - FAILED}/{TOTAL} 通过")
     return 1 if FAILED else 0
