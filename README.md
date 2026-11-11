@@ -186,7 +186,7 @@ ZCode 渲染层（file:// 加载 index.html）
 | 项 | 要求 | 用途 |
 | --- | --- | --- |
 | 操作系统 | Windows 10/11 | 注入 `app.asar`；`.bat` 维护入口 |
-| ZCode 桌面版 | 实测 3.17.2 | 被注入的目标 |
+| ZCode 桌面版 | 实测 3.17.2 / 3.18.0 | 被注入的目标 |
 | Python | 3.10+（实测 3.15） | `tools/*.py`、`.bat` 菜单 |
 | Node.js | 18+（实测 24） | 插件里的 MCP server（由 ZCode 拉起） |
 | 浏览器 | Chrome 或 Edge | 仅做 DOM 自测时需要 |
@@ -332,7 +332,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 
 > **谁能调这些接口**：只接受本机来源。不带 `Origin` 的命令行调用（上面的 PowerShell 示例）直接可用；
 > `file://` / 应用自定义协议（`Origin: null`）必须带 `X-ZCE-Token` —— 令牌由 `apply` 生成在
-> `%LOCALAPPDATA%\zcode-prompt-enhance\token`，同时写进注入脚本；外部 `http(s)://` 站点一律 403。
+> `%LOCALAPPDATA%\zcode-prompt-enhance\token`，同时写进注入脚本（**信标上报也带它**）；
+> 外部 `http(s)://` 站点一律 403。令牌文件不存在时，浏览器来源一律 401（fail closed），
+> 只有不带 `Origin` 的本地调用放行——避免「只校验 Origin」的旧行为被沙箱 iframe 利用。
 > 请求体上限 256KB（信标 64KB），超出返回 413。
 > 收紧的原因：`Access-Control-Allow-Origin: *` 时代，浏览器里任意网页都能用你的 key 调 `/api/enhance`。
 
@@ -473,11 +475,14 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `python tools/patch_zcode.py --force apply` | 允许"没有基线备份时仍删除 integrity 字段"（默认会拦下并说明原因） |
 | `python tools/patch_zcode.py --dry-run apply` | 演练：写到 `build/app.asar.dryrun`，不动原文件、不写状态、不生成令牌 |
 | `python tools/verify_patch.py --original <备份> --patched <asar>` | 全量逐字节校验（实测约 3.18 万文件） |
-| `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步（只统计本次启动） |
-| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 31 项 DOM 断言 |
-| `node tests/test_mcp_server.mjs` | 插件服务测试（66 项，含生命周期、端口冲突、令牌热更新） |
-| `python tests/test_patch_zcode.py` | asar 写入层测试（45 项：apply/幂等/刷新/还原/无基线保护） |
-| `python tests/test_entry_bat.py` | 入口 `.bat` 契约测试（34 项：编码/换行约定、退出码、参数透传与演练文案，不碰 ZCode） |
+| `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步（只读插件格式、只统计本次启动） |
+| `python tools/check_beacon.py --purge-legacy` | 物理删除日志里 Python 时代的旧格式行（只留插件格式），再照常分析 |
+| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 32 项 DOM 断言 |
+| `node tests/test_mcp_server.mjs` | 插件服务测试（72 项，含生命周期、端口冲突、令牌热更新） |
+| `python tests/test_patch_zcode.py` | asar 写入层测试（46 项：apply/幂等/刷新/还原/无基线保护） |
+| `python tests/test_entry_bat.py` | 入口 `.bat` 契约测试（35 项：编码/换行约定、退出码、参数透传与演练文案，不碰 ZCode） |
+| `python tests/test_plugin_manifest.py` | 插件清单契约测试（13 项：`plugin.json`/`.mcp.json`/变量名/脚本与 prompts 是否真的存在） |
+| `python tests/test_check_beacon.py` | 信标解析测试（13 项：只读插件格式、忽略旧格式、BOM/损坏行/缓存失效、purge 幂等） |
 | `python tools/menu.py [apply\|status\|check\|restore]` | `.bat` 的实际实现，也可直接调（`-h` 看用法） |
 
 `--asar` / `--backup` / `--endpoint` 三个选项可以透传给 `.bat`（写在动作之后，选项在子命令之前）：
@@ -613,6 +618,18 @@ python "<项目目录>\tools\patch_zcode.py" restore
 `check_beacon.py` **只统计最后一次启动**的信标——否则上一次运行成功留下的 `attached`
 会冒充本次成功。日志长到几轮会话后，它打印的是**最后 40 条**，避免看到几天前的旧记录。
 
+日志里可能还残留早期 Python 服务写的 `<ISO 时间戳> {json}` 旧格式行（本机实测 21 行）。
+`check_beacon.py` **只读插件写的纯 JSON 行**，旧格式只计数、不展示——否则那批旧记录
+会混进「本次启动」的统计，也会把展示区占满。想彻底删掉它们：
+
+```powershell
+python tools/check_beacon.py --purge-legacy
+```
+
+它只删「非空且不以 `{` 开头」的行（按字节逐行处理，CRLF / 空行 / 损坏的插件行都原样保留），
+临时文件 + `os.replace` 原子替换，可反复执行（第二次起提示「无需清理」）。
+建议在 ZCode 退出时跑，避免清理期间新写入的信标被覆盖。
+
 ### 按钮在，但点了报错
 
 | 现象 | 原因 | 处理 |
@@ -663,9 +680,11 @@ zcode-prompt-enhance/
 │   ├─ run_dom_test.py             无头浏览器 DOM 自测
 │   └─ menu.py                     维护菜单（.bat 的实际内容）
 ├─ tests/
-│   ├─ test_mcp_server.mjs         插件服务测试（66 项，含生命周期与令牌热更新）
-│   ├─ test_patch_zcode.py         asar 写入层测试（45 项，用合成小包）
-│   └─ test_entry_bat.py           入口 .bat 契约测试（编码/换行、退出码、参数转发）
+│   ├─ test_mcp_server.mjs         插件服务测试（72 项，含生命周期与令牌热更新）
+│   ├─ test_patch_zcode.py         asar 写入层测试（46 项，用合成小包）
+│   ├─ test_entry_bat.py           入口 .bat 契约测试（编码/换行、退出码、参数转发）
+│   ├─ test_plugin_manifest.py     插件清单契约测试（变量名/脚本/prompts 是否可用）
+│   └─ test_check_beacon.py        信标解析测试（只读插件格式、忽略旧格式）
 ├─ web/                            本地预览页 + DOM 自测用页面
 ├─ 修复增强提示词按钮.bat          维护入口（双击运行：注入/状态/检查/还原）
 ├─ .env.example                    通道 B 环境变量参考（不会被自动加载）
@@ -677,21 +696,29 @@ zcode-prompt-enhance/
 ## 开发与测试
 
 ```powershell
-# 插件服务测试：MCP 握手、tools/call、HTTP、端口冲突、令牌热更新、stdin 关闭即退出（66 项）
+# 插件服务测试：MCP 握手、tools/call、HTTP、端口冲突、令牌热更新、stdin 关闭即退出（72 项）
 node tests/test_mcp_server.mjs
 
 # 注入脚本 DOM 自测：按钮位置、type=button、空输入、写回、还原、失败保草稿、
-# 官方 API 优先、写回全失败的信标（31 项，需要 Chrome/Edge）
+# 官方 API 优先、写回全失败的信标（32 项，需要 Chrome/Edge）
 python tools/run_dom_test.py
 
 # asar 写入层测试：在临时目录里合成小包，跑 apply / 幂等 / 刷新 / --out / restore /
-# 无基线保护 / 非法包（45 项，不碰真实安装包）
+# 无基线保护 / 非法包（46 项，不碰真实安装包）
 python tests/test_patch_zcode.py
 
 # 入口 .bat 契约测试：UTF-8 无 BOM / 仅 CRLF / 非 ASCII 只在 echo 行、退出码 0/1/2、
 # 参数写错必须报错而不是被静默丢弃、选项真的搬到 patch_zcode、演练文案不说“已写入”、
-# restore 遇关闭的 stdin 当作取消（34 项，不碰 ZCode、不联网）
+# restore 遇关闭的 stdin 当作取消（35 项，不碰 ZCode、不联网）
 python tests/test_entry_bat.py
+
+# 插件清单契约测试：plugin.json 的 mcpServers 指向的文件存在、变量名都在 ZCode 支持集合内、
+# 替换 ${CLAUDE_PLUGIN_ROOT} 后脚本存在、prompts/ 随插件打包（13 项，不碰 ZCode）
+python tests/test_plugin_manifest.py
+
+# 信标解析测试：只读插件格式（纯 JSON）、忽略 Python 时代旧格式、BOM/损坏行/缓存失效、
+# purge 只删旧格式且幂等（13 项）
+python tests/test_check_beacon.py
 
 # 全量逐字节校验（需先拿到原始备份）
 python tools/verify_patch.py --original "<备份>" --patched "D:\Program Files\ZCode\resources\app.asar"
@@ -702,11 +729,18 @@ python tools/verify_patch.py --original "<备份>" --patched "D:\Program Files\Z
 先跑一次 `python tools/run_dom_test.py --keep` 生成该文件，再打开页面；否则脚本 404、看不到按钮。
 `web/mock-selftest.js` 里的断言同样只在无头浏览器（`run_dom_test.py`）里执行。
 
-改完 `inject/zcode-enhance.js` 或 `prompts/` 后：
+改完 `inject/zcode-enhance.js` 或 `plugins/enhance-service/` 下的内容后：
 
-- 注入脚本：直接重新 `apply` 即可 —— 已注入的包会走「刷新脚本」路径，不需要先 `restore`
-  （基线被删掉也能刷新）；
-- 提示词：插件从自身目录读 `prompts/`，改完需要重装插件或直接改已安装副本，然后**重启 ZCode**。
+- **注入脚本**：直接重新 `apply` 即可 —— 已注入的包会走「刷新脚本」路径，不需要先 `restore`
+  （基线被删掉也能刷新），然后重启 ZCode；
+- **插件代码/提示词**：ZCode 实际运行的是**安装缓存副本**，改仓库里的源码不会生效。
+  缓存路径（实测）：
+  ```
+  %USERPROFILE%\.zcode\cli\plugins\cache\<marketplace 名>\enhance-service\<version>\
+  ```
+  要生效二选一：①在插件市场里重装（推荐，改版本号更稳妥）；②直接改上面那份缓存副本。
+  之后必须**完全重启 ZCode**（旧 MCP server 不会随卸载退出，仍占着 8770）。
+  用 `python tests/test_plugin_manifest.py` 可以先确认清单与脚本/prompts 的路径都说得通。
 
 ---
 
@@ -759,6 +793,33 @@ ZCode 的插件机制只开放 `availability: "session"` 的侧栏面板，**没
 同理，断言「UI 会反复提示更新」也曾误判——判定是 `installed.version === marketplace.version → synced`，
 是改过缓存副本的版本号造成的假象。**先读判定逻辑再下结论。**
 
+### 坑四：插件里的 `${CLAUDE_PLUGIN_ROOT}` 由 ZCode 解析成「安装缓存目录」
+
+`.mcp.json` 里的 `${CLAUDE_PLUGIN_ROOT}` 不是 Claude Code 专属：ZCode 的 MCP 配置展开函数把它
+和 `${ZCODE_PLUGIN_ROOT}` 映射到同一个值（插件安装根目录），并对 `command` / `args` / `cwd` / `env`
+都做替换。实测（插件 0.1.4 时）运行中的进程是：
+
+```
+node C:\Users\<你>\.zcode\cli\plugins\cache\dev-zcode-prompt-enhance\enhance-service\<version>\scripts\mcp-server.mjs
+```
+
+也就是说：**ZCode 跑的是缓存副本，不是你 clone 的仓库目录**。这带来两个必须记住的后果：
+
+1. 改 `plugins/enhance-service/` 下的任何文件（含 `prompts/`）都不会自动生效，必须重装插件
+   （或直接改缓存副本）+ 完全重启 ZCode；
+2. `mcp-server.mjs` 用 `import.meta.url` 定位自身目录来读 `prompts/`，所以缓存副本必须
+   把 `prompts/` 一起带上——`tests/test_plugin_manifest.py` 就是在守这条。
+
+排错时若看到「插件已启用但没有 node 进程」，先确认变量名只用了 ZCode 支持的
+`${CLAUDE_PLUGIN_ROOT}` / `${ZCODE_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_DATA}` / `${ZCODE_PLUGIN_DATA}` /
+`${CLAUDE_PROJECT_DIR}` / `${ZCODE_PROJECT_DIR}`：**未知变量不会被替换**，会原样传给 spawn 并失败。
+
+还要注意：本地市场本身也会被**镜像成实体副本**到
+`%USERPROFILE%\.zcode\cli\plugins\marketplaces\<市场名>\`。改了仓库里的
+`marketplace.json` / `plugin.json` 版本号后，插件市场 UI 里可能仍显示旧版本——
+需要重启 ZCode（或在市场里移除后重新添加）让它重新镜像，再安装/更新插件。
+不要手改这份镜像去"凑"版本号，否则会出现「显示已是最新、实际跑的还是旧代码」的假象。
+
 ### 实测数据（2026-11-10，ZCode 3.17.2）
 
 | 项 | 结果 |
@@ -777,9 +838,15 @@ ZCode 的插件机制只开放 `availability: "session"` 的侧栏面板，**没
 
 - **仅 Windows**：依赖 Windows 路径、`Program Files` 权限模型与 `.bat` 入口；其它平台需自行改造。
 - **每次 ZCode 升级后需要重新注入**（`app.asar` 会被覆盖）。升级后 `apply` 即可（幂等）。
+- **刷新注入脚本会让 `app.asar` 变大**：刷新（脚本内容有变时的 `apply`）会把 `index.html`
+  与新脚本追加到文件末尾，旧副本成为死区（数据区不重排）。单次约 +几十 KB，反复刷新会持续增大；
+  在意体积时先 `restore` 再 `apply`，可回到"一份新增 + 一处标签改动"的最小增量。
 - **依赖 ZCode 的 DOM 结构与内部 API**：选择器（`data-composer-layout` 等）或
   `editorApiRef` 一旦变化，需要同步更新 `inject/zcode-enhance.js`；写回失败会明确提示而不是假装成功。
 - **更新插件后必须重启 ZCode**（旧 MCP server 不会随卸载退出）。
+- **`node` 必须在 ZCode 进程的 PATH 里**：`.mcp.json` 用 `command: "node"`（与 ZCode 自带第三方插件
+  的写法一致）。用 nvm / volta 等**只在 shell 里生效**的方式装 Node 时，ZCode 拉起的子进程可能
+  找不到 `node`，表现为「插件已启用但没有 node 进程」；可改用系统级安装或把 Node 加进用户 PATH。
 - **`127.0.0.1:8770` 只能有一个实例**：由插件占用，不要再起第二个服务（不随 ZCode 启停、还会抢端口）。
 - **打补丁时必须退出 ZCode**：`app.asar` 被占用时 `apply` 会明确报错并保持原文件不变
   （不再退化成"就地覆写"，那种写法一旦中断就会留下半截 asar）。
