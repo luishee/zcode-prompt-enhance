@@ -9,8 +9,12 @@ cmd.exe 以固定大小的缓冲分块读取批处理文件，UTF-8 的多字节
 用法：
     python tools/menu.py                        交互菜单
     python tools/menu.py apply                  直接执行（apply|status|check|restore）
+    python tools/menu.py -h                     显示用法
     python tools/menu.py --asar E:\\ZCode\\resources\\app.asar apply
                                                 带路径参数（动作与选项前后都行）
+
+参数写错一律以退出码 2 结束（与 README 的退出码表一致）：`.bat` 原样转发参数，
+若这里把“写错的选项”当成“没看见”，就会出现「参数写了没生效、却看不出异常」。
 """
 
 from __future__ import annotations
@@ -145,16 +149,33 @@ VERBS = {
 }
 
 
+class UsageError(Exception):
+    """命令行用法错误。
+
+    统一走退出码 2：早先这些分支用的是 `raise SystemExit(文案)`，退出码是 1，
+    而“未知动作”返回 2——同一个“参数写错了”却有两个码，`.bat` 的自动化无法区分
+    「参数不对」和「执行失败」（README 的退出码表也写着 2 = 参数不认识）。
+    """
+
+
+USAGE = (
+    "用法：menu.py [apply|status|check|restore] [--asar 路径] [--backup 路径]\n"
+    "             [--endpoint URL] [--out 路径] [--force] [--full-verify] [--dry-run]\n"
+    "      menu.py -h | --help | /?          显示本帮助\n"
+    "\n"
+    "只认 patch_zcode.py 真正支持的选项（写错立刻报错，不悄悄忽略）；\n"
+    "动作与选项的先后顺序都接受：`apply --asar X` 与 `--asar X apply` 等价。"
+)
+
+HELP_ARGS = {"-h", "--help", "/?", "?", "help"}
+
+
 def parse_argv(argv: list[str]) -> tuple[str | None, list[str]]:
     """把命令行拆成 (动作, 透传给 patch_zcode 的参数)。
 
     只认 patch_zcode 真正支持的选项（写错时立刻报错，而不是悄悄忽略）。
     动作与选项的先后顺序都接受：`apply --asar X` 和 `--asar X apply` 等价。
     """
-    usage = (
-        "用法：menu.py [apply|status|check|restore] [--asar 路径] [--backup 路径] "
-        "[--endpoint URL] [--out 路径] [--force] [--full-verify] [--dry-run]"
-    )
     verb: str | None = None
     out: list[str] = []
     i = 0
@@ -163,7 +184,7 @@ def parse_argv(argv: list[str]) -> tuple[str | None, list[str]]:
         name, has_value, _inline = arg.partition("=")
         if name in PATCH_FLAG_OPTS:
             if has_value:
-                raise SystemExit(f"{name} 是开关，不接受值\n{usage}")
+                raise UsageError(f"{name} 是开关，不接受值\n\n{USAGE}")
             out.append(name)
             i += 1
             continue
@@ -173,14 +194,14 @@ def parse_argv(argv: list[str]) -> tuple[str | None, list[str]]:
                 i += 1
                 continue
             if i + 1 >= len(argv):
-                raise SystemExit(f"{name} 需要一个值，例如 {name} <路径>\n{usage}")
+                raise UsageError(f"{name} 需要一个值，例如 {name} <路径>\n\n{USAGE}")
             out += [name, argv[i + 1]]
             i += 2
             continue
         if arg.startswith("-"):
-            raise SystemExit(f"未知参数：{arg}\n{usage}")
+            raise UsageError(f"未知参数：{arg}\n\n{USAGE}")
         if verb is not None:
-            raise SystemExit(f"多给了动作：{verb} 和 {arg}\n{usage}")
+            raise UsageError(f"多给了动作：{verb} 和 {arg}\n\n{USAGE}")
         verb = arg.strip().lower()
         i += 1
     return verb, out
@@ -189,17 +210,31 @@ def parse_argv(argv: list[str]) -> tuple[str | None, list[str]]:
 def main() -> int:
     force_utf8(line_buffering=True)
 
-    verb, forward = parse_argv(sys.argv[1:])
+    argv = sys.argv[1:]
+
+    if any(arg.strip().lower() in HELP_ARGS for arg in argv):
+        print(USAGE)
+        return 0
+
+    try:
+        verb, forward = parse_argv(argv)
+    except UsageError as exc:
+        print(exc)
+        return 2
+
     if verb is not None and verb not in VERBS:
-        print(f"未知动作：{verb}")
-        print("用法：menu.py [apply|status|check|restore] [--asar 路径] ...")
+        print(f"未知动作：{verb}\n")
+        print(USAGE)
         return 2
 
     FORWARD.extend(forward)
     if verb is not None:
         return VERBS[verb]()
     if FORWARD:
-        raise SystemExit("请同时指定动作：apply | status | check | restore")
+        # 给了选项却没给动作：也是用法问题，同样走 2（早先是 SystemExit(文案) → 1）。
+        print("请同时指定动作：apply | status | check | restore\n")
+        print(USAGE)
+        return 2
 
     while True:
         print(MENU)
