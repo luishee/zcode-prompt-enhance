@@ -56,7 +56,7 @@ def main() -> int:
 
     # 先找浏览器再写临时文件：否则找不到浏览器时会在 web/ 下留下一个孤儿文件
     browser = args.browser or find_browser()
-    page = WEB_DIR / "mock_composer.html"
+    page = WEB_DIR / "mock-composer.html"
 
     try:
         prepare(args.endpoint)

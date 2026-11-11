@@ -724,7 +724,7 @@ python tests/test_check_beacon.py
 python tools/verify_patch.py --original "<备份>" --patched "D:\Program Files\ZCode\resources\app.asar"
 ```
 
-`web/mock_composer.html` 是仿 composer 结构的本地预览页，但页面引用的是
+`web/mock-composer.html` 是仿 composer 结构的本地预览页，但页面引用的是
 `web/zcode-enhance.local.js`（由 `run_dom_test.py` 生成、跑完即删）。想用浏览器手动查看，
 先跑一次 `python tools/run_dom_test.py --keep` 生成该文件，再打开页面；否则脚本 404、看不到按钮。
 `web/mock-selftest.js` 里的断言同样只在无头浏览器（`run_dom_test.py`）里执行。
