@@ -202,7 +202,12 @@ def parse_argv(argv: list[str]) -> tuple[str | None, list[str]]:
                 continue
             if i + 1 >= len(argv):
                 raise UsageError(f"{name} 需要一个值，例如 {name} <路径>\n\n{USAGE}")
-            out += [name, argv[i + 1]]
+            value = argv[i + 1]
+            # 别把下一个选项当成值：`--asar --force apply` 若照搬会把 --force 传给
+            # argparse，报错指向下游、难以定位；这里直接当作用法错误（退出码 2）。
+            if value.startswith("-"):
+                raise UsageError(f"{name} 需要一个值，但读到的是选项 {value}\n\n{USAGE}")
+            out += [name, value]
             i += 2
             continue
         if arg.startswith("-"):

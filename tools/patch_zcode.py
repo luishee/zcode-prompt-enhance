@@ -265,10 +265,24 @@ def write_in_place(path: Path, blob: bytes) -> str:
          374MB 的 app.asar 就是半截文件，ZCode 直接起不来。
     """
     tmp = path.with_name(path.name + ".zce-tmp")
-    with open(tmp, "wb") as fp:
-        fp.write(blob)
-        fp.flush()
-        os.fsync(fp.fileno())
+    # 临时文件写入本身也要挡住：Program Files 下无写权限时，失败发生在 open(tmp)
+    # 而不是后面的 os.replace，早先这段在 try 之外，会直接抛未捕获的 OSError
+    # traceback（调用方只捕 RuntimeError），把「请退 ZCode / 用管理员」的提示吃掉。
+    try:
+        with open(tmp, "wb") as fp:
+            fp.write(blob)
+            fp.flush()
+            os.fsync(fp.fileno())
+    except OSError as exc:
+        try:  # 清理失败不该掩盖真正的写入错误
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"无法在 {path.parent} 写入临时文件 {tmp.name}：{exc}\n"
+            "  最常见原因是 ZCode 还在运行（含托盘图标），或当前账号没有该目录的写权限。\n"
+            "  请完全退出 ZCode 后重试；必要时以管理员身份运行本工具。"
+        ) from exc
 
     try:
         os.replace(tmp, path)
@@ -618,9 +632,11 @@ def cmd_apply(args) -> int:
         if in_place and backup.exists():
             print("→ 校验未通过，自动回滚")
             try:
-                shutil.copy2(backup, asar)
-                print(f"✓ 已还原：{asar} <- {backup}")
-            except OSError as exc:
+                # 回滚同样走原子替换：就地 copy2 若中途失败会留下半截 asar，
+                # 而这时正是"已经出过一次问题"的场景，不能雪上加霜。
+                how = write_in_place(asar, backup.read_bytes())
+                print(f"✓ 已还原：{asar} <- {backup}（{how}）")
+            except (OSError, RuntimeError) as exc:
                 print(f"✗ 自动回滚失败：{exc}")
                 print(f"  请手动执行：copy /y \"{backup}\" \"{asar}\"")
         elif in_place:
@@ -675,19 +691,21 @@ def cmd_restore(args) -> int:
     if not asar.exists():
         print(f"找不到 {asar}（ZCode 可能已被卸载或换了安装目录）")
         return 1
+    # 还原也走原子替换（临时文件 + os.replace），而不是 shutil.copy2 的就地覆写：
+    # 374MB 拷贝中途被杀/断电同样会留下半截 asar，与 apply 的保护口径保持一致。
     try:
-        shutil.copy2(backup, asar)
-    except PermissionError:
-        print(f"✗ 无法写入 {asar}：文件被占用或权限不足")
-        print("  ZCode 正在运行（含托盘图标）时文件是锁住的，请完全退出后重试；")
-        print("  Program Files 下还需要管理员权限。")
-        return 1
+        data = backup.read_bytes()
     except OSError as exc:
-        print(f"✗ 还原失败：{exc}")
+        print(f"✗ 读不出备份 {backup}：{exc}")
         return 1
-    print(f"已还原：{asar} <- {backup}")
+    try:
+        how = write_in_place(asar, data)
+    except (RuntimeError, OSError) as exc:
+        print(f"✗ {exc}")
+        return 1
+    print(f"已还原：{asar} <- {backup}（{how}）")
 
-    # 还原也要验：copy2 中途失败（磁盘满 / 被杀 / 被占用）可能留下截断文件，
+    # 还原也要验：写入中途失败（磁盘满 / 被杀 / 被占用）可能留下截断文件，
     # 而"已还原"的提示会让人以为没事。有 originalSha256 就比对。
     expected = st.get("originalSha256")
     if expected:

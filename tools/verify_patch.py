@@ -92,8 +92,11 @@ def main() -> int:
             print("✗ index.html 的脚本标签缺失或重复")
             return 1
 
-    print(f"✓ 注入脚本 {len(js):,} 字节，端点与令牌已注入")
-    print("✓ index.html 恰好包含一个注入脚本标签")
+        # 打印放在 with 内：虽然 read() 已返回 bytes、关闭句柄后再用也安全，
+        # 但读起来像"读完就关了还在用"，与文件顶部批评的写法混淆。
+        print(f"✓ 注入脚本 {len(js):,} 字节，端点与令牌已注入")
+        print("✓ index.html 恰好包含一个注入脚本标签")
+
     print("全部校验通过")
     return 0
 

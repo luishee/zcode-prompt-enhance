@@ -143,6 +143,10 @@ def test_menu_cli() -> None:
     rc, out = run_menu("--asar")
     check("选项缺值 → 退出码 2", rc == 2 and "需要一个值" in out, f"rc={rc} out={out[:160]!r}")
 
+    rc, out = run_menu("--asar", "--force", "apply")
+    check("选项的值写成另一个选项 → 退出码 2（不把 --force 当路径）",
+          rc == 2 and "需要一个值" in out, f"rc={rc} out={out[:160]!r}")
+
     rc, out = run_menu("--force=1")
     check("开关被赋了值 → 退出码 2", rc == 2 and "不接受值" in out, f"rc={rc} out={out[:160]!r}")
 

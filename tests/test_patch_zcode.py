@@ -328,6 +328,20 @@ def case_units(tmp: Path) -> None:
     finally:
         packer2.close()
 
+    # write_in_place 的临时文件写入失败必须转成 RuntimeError（带可操作提示），
+    # 而不是漏出裸 OSError traceback —— cmd_apply 只捕 RuntimeError，
+    # 否则"Program Files 无写权限"这个高频场景会退化成看不懂的栈。
+    missing = tmp / "no-such-dir" / "app.asar"
+    outcome = "no-raise"
+    try:
+        patch_zcode.write_in_place(missing, b"data")
+    except RuntimeError:
+        outcome = "RuntimeError"
+    except OSError as exc:  # noqa: BLE001
+        outcome = f"OSError:{type(exc).__name__}"
+    check("write_in_place 写临时文件失败 → RuntimeError（不裸抛 OSError）",
+          outcome == "RuntimeError", outcome)
+
 
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="zce-patch-test-") as tmpdir:
