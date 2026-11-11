@@ -120,6 +120,13 @@ check('只剥一层', mod.stripWrappingQuotes('""a""') === '"a"');
   check('不误删含「中文」的正常句', r.removed === 0 && r.text === normal);
 }
 {
+  // 语言词不在句末的正常要求不能被当成元信息
+  // （早先「输入可以是中文或英文，输出必须是纯文本」被整行删掉——实测确认过）。
+  const req = '输入可以是中文或英文，输出必须是纯文本';
+  const r = mod.stripMetaLines(req);
+  check('不误删「输入可以是中文或英文…」这类正常要求', r.removed === 0 && r.text === req, JSON.stringify(r));
+}
+{
   const long = '无论用户使用什么语言，输出都必须与原始需求保持一致的表达风格，并且要完整覆盖所有要点。'.repeat(2);
   check('长正文不判为元信息', mod.stripMetaLines(long).removed === 0);
 }
@@ -136,6 +143,8 @@ check('清理「增强后的提示词：」前缀',
   check('按显示名匹配', mod.resolveModel({ models: [] }, 'DeepSeek Flash', avail) === 'deepseek-flash');
   check('大小写不敏感', mod.resolveModel({ models: [] }, 'deepseek flash', avail) === 'deepseek-flash');
   check('留空用通道默认', mod.resolveModel({ models: ['def'] }, '', avail) === 'def');
+  check('留空且通道无默认时回退上游列表', mod.resolveModel({ models: [] }, '', avail) === 'deepseek-flash');
+  check('留空且两边都没有时返回空串', mod.resolveModel({ models: [] }, '', []) === '');
   check('匹配不上原样传', mod.resolveModel({ models: [] }, 'mystery', avail) === 'mystery');
 }
 
@@ -417,6 +426,12 @@ check('健康检查里能看到通道', (healthy?.channels ?? []).some((c) => c.
   check('403 不带 CORS 头（网页读不到响应）', !res.headers['access-control-allow-origin']);
 }
 {
+  // 没有令牌文件时，浏览器来源（Origin: null）必须直接拒绝（fail closed），
+  // 而不是退回"只校验 Origin"的旧行为——否则本机任意网页都能用用户的 key 花钱。
+  const res = await raw(PORT, '/api/health', { headers: { Origin: 'null' } });
+  check('无令牌 + 浏览器来源 → 401（fail closed）', res.status === 401, `status=${res.status}`);
+}
+{
   const res = await raw(PORT, '/api/beacon', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'x'.repeat(200 * 1024),
   });
@@ -564,6 +579,20 @@ await wait(120);
 
   const noOrigin = await raw(TOKEN_PORT, '/api/health');
   check('无 Origin 的本地调用仍免令牌（README 的 curl 用法保持可用）', noOrigin.status === 200);
+
+  // 回归：注入层的 beacon 必须和 enhance 一样带令牌，
+  // 否则令牌生效后所有诊断信标被 401，"按钮不显示"时 check_beacon 一条都读不到。
+  const beaconNoToken = await raw(TOKEN_PORT, '/api/beacon', {
+    method: 'POST', headers: { Origin: 'null', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stage: 'boot' }),
+  });
+  check('令牌模式：beacon 缺令牌 → 401', beaconNoToken.status === 401, `status=${beaconNoToken.status}`);
+  const beaconWithToken = await raw(TOKEN_PORT, '/api/beacon', {
+    method: 'POST',
+    headers: { Origin: 'null', 'Content-Type': 'application/json', 'X-ZCE-Token': 'rotated-token-456' },
+    body: JSON.stringify({ stage: 'boot', session: 'tok-sess' }),
+  });
+  check('令牌模式：beacon 带令牌 → 200', beaconWithToken.status === 200, `status=${beaconWithToken.status}`);
 
   c3.kill();
   await wait(150);

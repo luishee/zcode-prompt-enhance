@@ -23,6 +23,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { timingSafeEqual } from 'node:crypto';
 
 const SERVER_NAME = 'enhance-service';
 
@@ -61,10 +62,17 @@ const FENCE_RE = /^\s*```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n?\s*```\s*$/;
 
 // 模型偶尔会把「语言判定」写进结果（WorkBuddy 的 BAD OUTPUT 示例就是这种）。
 // 只在整行都是元信息、且整行 ≤80 字时才删，避免误伤正文里出现「中文」的正常句子。
+//
+// 语言词必须落在句末（允许尾随标点）：早先语言词只要出现就删，会把
+// 「输入可以是中文或英文，输出必须是纯文本」这类正常要求整行吃掉（实测如此）。
+const LANG_TOKEN = '(?:中文|英文|英语|日文|日语|Chinese|English)';
 const META_LINE_PATTERNS = [
-  /^\s*(?:用户输入|输入|input|user input)[^\n]{0,16}(?:是|为|is)[^\n]{0,16}(?:中文|英文|英语|日文|日语|Chinese|English)/i,
-  /^\s*(?:回复|响应|输出|response|output|answer)[^\n]{0,18}(?:必须|应该|应|须|must|should)[^\n]{0,18}(?:中文|英文|英语|Chinese|English)/i,
-  /^\s*(?:用户输入|输入|input)[^\n]{0,40}(?:→|->)[^\n]{0,40}(?:回复|响应|输出|response|output)[^\n]{0,40}$/i,
+  // 「用户输入是中文」/「User input is in Chinese」
+  new RegExp(`^\\s*(?:用户输入|输入|input|user input)[^\\n]{0,16}(?:是|为|is)[^\\n]{0,16}${LANG_TOKEN}[\\s，,。.；;、!！?？:：]*$`, 'i'),
+  // 「回复必须用中文」/「Response must be in Chinese」
+  new RegExp(`^\\s*(?:回复|响应|输出|response|output|answer)[^\\n]{0,18}(?:必须|应该|应|须|must|should)[^\\n]{0,18}${LANG_TOKEN}[\\s，,。.；;、!！?？:：]*$`, 'i'),
+  // 箭头式「输入 → 回复」：主语允许中英混合（含 "User input ..."）
+  new RegExp(`^\\s*(?:用户输入|输入|user input|input)[^\\n]{0,40}(?:→|->)[^\\n]{0,40}(?:回复|响应|输出|response|output)[^\\n]{0,40}$`, 'i'),
 ];
 const LEADING_LABEL_RE =
   /^\s*(?:增强(?:后)?的?提示词|改写后的提示词|优化后的提示词|enhanced prompt|revised prompt|improved prompt)\s*[:：]\s*/i;
@@ -107,6 +115,14 @@ if (!STARTUP_TOKEN) {
  */
 function currentToken() {
   return readToken() || STARTUP_TOKEN;
+}
+
+/** 常量时间比较令牌，避免用响应时间逐字节试探（localhost 风险低，但顺手做对）。 */
+function tokensMatch(presented, expected) {
+  if (typeof presented !== 'string' || typeof expected !== 'string') return false;
+  const a = Buffer.from(presented, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function rotateBeaconLog() {
@@ -181,7 +197,8 @@ function cleanResult(raw) {
   let s = stripWrappingQuotes(raw);
   s = s.replace(LEADING_LABEL_RE, '').trim();
   const { text, removed } = stripMetaLines(s);
-  return { text: stripWrappingQuotes(text), removedMetaLines: removed };
+  // 这里只 trim，不再剥一次引号：删掉元信息行后露出的首尾引号往往是内容本身的一部分。
+  return { text: text.trim(), removedMetaLines: removed };
 }
 
 // ------------------------------------------------------------------ 通道配置
@@ -311,17 +328,19 @@ function requestJson(urlStr, { method = 'POST', headers = {}, body = null, timeo
   });
 }
 
-const modelCache = new Map(); // baseUrl -> { at, models }
+const modelCache = new Map(); // `${baseUrl}|${apiKey}` -> { at, models }
 
 async function listModels(ch, timeoutMs = MODELS_TIMEOUT_MS) {
-  const cached = modelCache.get(ch.baseUrl);
+  // 键带上 apiKey：同一 baseUrl 换 key / provider 后不该命中旧模型列表
+  const cacheKey = `${ch.baseUrl}|${ch.apiKey || ''}`;
+  const cached = modelCache.get(cacheKey);
   if (cached && Date.now() - cached.at < MODELS_CACHE_MS) return cached.models;
   try {
     const data = await requestJson(`${ch.baseUrl}/models`, { method: 'GET', headers: authHeaders(ch), timeoutMs });
     const models = (data.data ?? [])
       .filter((m) => m && m.id)
       .map((m) => ({ id: m.id, name: m.name || m.id }));
-    modelCache.set(ch.baseUrl, { at: Date.now(), models });
+    modelCache.set(cacheKey, { at: Date.now(), models });
     return models;
   } catch {
     return []; // 列出模型失败不影响增强，后续按通道配置的模型继续
@@ -335,7 +354,9 @@ function authHeaders(ch) {
 /** 前端可能传显示名（DOM 上看到的是 name），按 id → name 两轮匹配归一到上游 id。 */
 function resolveModel(ch, requested, available) {
   const want = String(requested ?? '').trim();
-  if (!want) return ch.models[0] ?? '';
+  // 没点名时：先看通道配置里的默认模型，再看上游 /models 的返回（早先只用前者，
+  // 于是「通道 B 配了端点但没配 model」会误报「该通道没有可用模型」，尽管列表取到了）。
+  if (!want) return ch.models[0] ?? available[0]?.id ?? '';
   for (const m of available) if (m.id === want) return m.id;
   const low = want.toLowerCase();
   for (const m of available) {
@@ -536,11 +557,24 @@ function createHttpServer() {
       res.end();
       return;
     }
-    // 浏览器来源必须带令牌；不开 Origin 的本地命令行工具照旧可用（README 里的 curl 用法）
+    // 浏览器来源（file:// 与自定义协议的 Origin: null / scheme://）一律必须带访问令牌：
+    //   有令牌 → 常量时间校验；没有令牌文件 → 直接拒绝（fail closed），
+    //   否则本机任意网页（含沙箱 iframe 的 Origin: null）都能用用户的 key 调 /api/enhance。
+    // 不带 Origin 的本地命令行调用（README 里的 curl / PowerShell）保持免令牌。
     const token = currentToken();
-    if (origin && token && req.headers['x-zce-token'] !== token) {
-      sendJson(res, 401, { success: false, error: 'missing or invalid token' }, cors);
-      return;
+    if (origin) {
+      if (!token) {
+        sendJson(res, 401, {
+          success: false,
+          error: '服务尚未生成访问令牌，浏览器来源的调用已被拒绝；'
+            + '请先运行一次「修复增强提示词按钮.bat」的注入流程生成令牌',
+        }, cors);
+        return;
+      }
+      if (!tokensMatch(req.headers['x-zce-token'], token)) {
+        sendJson(res, 401, { success: false, error: 'missing or invalid token' }, cors);
+        return;
+      }
     }
 
     try {
