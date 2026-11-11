@@ -86,7 +86,10 @@
     try {
       fetch(`${ENDPOINT}/api/beacon`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // 必须带令牌：渲染层的 Origin 是 null / 自定义协议，服务端对「浏览器来源」
+        // 一律要求 X-ZCE-Token。早先这里只发 Content-Type，令牌生效后信标全被 401，
+        // 于是按钮不显示时 check_beacon 一条都读不到（诊断能力正好在最需要时失效）。
+        headers: apiHeaders(),
         body: payload,
         keepalive: true,
       })

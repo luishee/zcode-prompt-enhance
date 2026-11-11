@@ -72,7 +72,7 @@
     const url = typeof input === 'string' ? input : (input && input.url) || '';
     let body = null;
     try { body = init && typeof init.body === 'string' ? JSON.parse(init.body) : null; } catch { /* ignore */ }
-    window.__calls.push({ url, body });
+    window.__calls.push({ url, body, headers: (init && init.headers) || {} });
 
     // 自测模式下不真的联网，直接回一个假结果。
     // 必须尊重 init.signal 与 __mockDelay：否则「请求途中取消」这条路径没法测。

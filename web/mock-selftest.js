@@ -171,6 +171,11 @@
     check('写回全失败 → 上报 write-failed 信标（含策略与长度）',
       !!failBeacon && Array.isArray(failBeacon.body.tried) && typeof failBeacon.body.wantLen === 'number',
       failBeacon ? JSON.stringify(failBeacon.body).slice(0, 120) : '无信标');
+    // 信标必须带令牌：渲染层 Origin 是 null / 自定义协议，服务端对浏览器来源要求
+    // X-ZCE-Token，漏了它令牌生效后信标会全被 401（诊断能力正好在最需要时失效）。
+    check('信标请求带 X-ZCE-Token（否则令牌生效后诊断信标被 401）',
+      !!failBeacon && !!(failBeacon.headers && failBeacon.headers['X-ZCE-Token']),
+      failBeacon ? JSON.stringify(failBeacon.headers || {}) : '无信标');
     // 会话 id 是 check_beacon 区分「本次启动 / 上次启动」的唯一依据：
     // 只按 url 划分会把上次的 attached 算成本次成功（会误报"已挂上"）。
     check('信标带 session 与 url（供 check_beacon 区分本次启动）',
