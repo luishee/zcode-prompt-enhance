@@ -1,12 +1,17 @@
 """解读注入脚本的诊断信标，判断按钮卡在哪一步。
 
 用法：
-    python tools/check_beacon.py [--wait 秒数]
+    python tools/check_beacon.py [--wait 秒数] [--purge-legacy]
+    --purge-legacy：先物理删除旧格式行（只留插件格式），再做常规分析
 
 看不到 ZCode 的 DOM 时，靠这份日志区分三类失败：
   1. 完全没有 boot → 补丁没生效 / ZCode 没重启 / 脚本路径被拦；
   2. 有 boot 但没有 composer-seen → 输入框选择器失配（DOM 结构变了）；
   3. 有 composer-seen 但 attach-failed → 锚点失配（工具栏结构变了）。
+
+只认**插件格式**的信标：插件（MCP server）写的是单行纯 JSON，一定以 `{` 开头。
+已退役的 Python 服务写的是 "<ISO 时间戳> {json}"（前面带时间戳），这类旧格式一律忽略，
+否则几天前那批记录会混进「本次启动」的统计，也会把下面的展示区占满。
 """
 
 from __future__ import annotations
@@ -24,61 +29,129 @@ from zce_common import force_utf8  # noqa: E402
 # 信标由插件（MCP server）写入 %LOCALAPPDATA%\zcode-prompt-enhance\beacon.log。
 # 已退役的 Python 服务曾写在仓库 logs/ 下；那条回退分支已删除——它在两个位置都不存在时
 # 会报出旧路径，让人误以为在看插件日志（实际排查时被这个坑过一次）。
-_PRIMARY_LOG = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "zcode-prompt-enhance" / "beacon.log"
+LOG_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "zcode-prompt-enhance" / "beacon.log"
+
+# --wait 轮询时同一份日志会被反复读：按 (大小, mtime) 记忆化，内容没变就不重新解析。
+_CACHE: dict[tuple[int, int], tuple[list[dict], int]] = {}
 
 
-def resolve_log() -> tuple[Path, str]:
-    """返回 (要读的路径, 来源说明)。"""
-    if _PRIMARY_LOG.exists():
-        return _PRIMARY_LOG, "插件（当前实现）"
-    return _PRIMARY_LOG, "期望位置，尚不存在"
+def read_events() -> tuple[list[dict], int]:
+    """返回 (插件格式事件, 被忽略的旧格式行数)。
 
+    判据：插件写的是单行纯 JSON（以 `{` 开头）；旧 Python 服务写的是
+    "<ISO 时间戳> {json}"。只解析前者，旧格式只计数不展示。
+    """
+    try:
+        st = LOG_PATH.stat()
+    except OSError:
+        return [], 0
+    stamp = (st.st_size, st.st_mtime_ns)
+    if stamp in _CACHE:
+        return _CACHE[stamp]
 
-def read_events() -> list[dict]:
-    log_path, _ = resolve_log()
-    if not log_path.exists():
-        return []
-    events = []
-    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
+    events: list[dict] = []
+    legacy = 0
+    for line in LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip().lstrip("\ufeff")  # 容错：文件开头若带 BOM 也认得出插件格式
         if not line:
             continue
-        # 插件写的是 "<ISO 时间戳> {json}"，旧 Python 服务写的是纯 JSON。
-        # 两种都要能读，否则插件写的那份会被整行判成 unparsable，日志等于白记。
-        payload = line
         if not line.startswith("{"):
-            brace = line.find("{")
-            payload = line[brace:] if brace >= 0 else line
+            legacy += 1  # 旧格式（Python 时代），忽略
+            continue
         try:
-            events.append(json.loads(payload))
+            events.append(json.loads(line))
         except json.JSONDecodeError:
+            # 插件格式但坏了（例如写盘被打断）：不静默丢弃，标成 unparsable 让人看见
             events.append({"stage": "unparsable", "raw": line[:200]})
-    return events
+    result = (events, legacy)
+    _CACHE.clear()  # 只留最近一次，避免缓存无限增长
+    _CACHE[stamp] = result
+    return result
+
+
+def purge_legacy() -> tuple[int, int]:
+    """删掉日志里 Python 时代的旧格式行，只保留插件格式（纯 JSON）。
+
+    返回 (删除行数, 保留行数)。按字节逐行处理：
+      - 日志是本机服务写的 UTF-8，按字节过滤既不会因解码替换弄坏内容，
+        也能原样保留行尾（CRLF/LF 都不改）；
+      - 只删「非空且不以 `{` 开头」的行，空行与损坏的插件行（以 `{` 开头）都保留；
+      - 临时文件 + os.replace 原子替换，避免中途失败留下半截日志。
+
+    注意：这是维护动作，清理期间若有新信标写入可能被覆盖掉；建议 ZCode 退出时执行。
+    """
+    try:
+        raw = LOG_PATH.read_bytes()
+    except OSError:
+        return 0, 0
+
+    kept: list[bytes] = []
+    removed = 0
+    for line in raw.splitlines(keepends=True):
+        stripped = line.strip().lstrip(b"\xef\xbb\xbf")
+        if stripped and not stripped.startswith(b"{"):
+            removed += 1
+            continue
+        kept.append(line)
+
+    if removed:
+        tmp = LOG_PATH.with_name(LOG_PATH.name + ".tmp")
+        try:
+            tmp.write_bytes(b"".join(kept))
+            os.replace(tmp, LOG_PATH)
+        except OSError:
+            try:  # 清理失败不该掩盖原始错误
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        _CACHE.clear()
+    return removed, len(kept)
 
 
 def main() -> int:
     force_utf8()
     parser = argparse.ArgumentParser()
     parser.add_argument("--wait", type=float, default=0, help="等待日志出现的秒数")
+    parser.add_argument(
+        "--purge-legacy", action="store_true",
+        help="先删掉日志里 Python 时代旧的「<时间戳> {json}」行（只保留插件格式），再照常分析",
+    )
     args = parser.parse_args()
 
+    if args.purge_legacy:
+        try:
+            removed, kept = purge_legacy()
+        except OSError as exc:
+            print(f"✗ 清理旧格式日志失败：{exc}")
+            print("  日志可能正被插件写入，稍后重试；下面的分析将基于未清理的日志继续")
+        else:
+            if removed:
+                print(f"✓ 已清理 {removed} 行旧格式记录，保留 {kept} 行插件格式（{LOG_PATH}）")
+            else:
+                print(f"（没有旧格式记录，无需清理；{LOG_PATH}）")
+
     deadline = time.time() + args.wait
-    while args.wait and time.time() < deadline and not read_events():
+    while args.wait and time.time() < deadline and not read_events()[0]:
         time.sleep(2)
 
-    events = read_events()
-    log_path, source = resolve_log()
+    events, legacy = read_events()
     if not events:
         print("✗ 没有任何信标，无法判断按钮为何不出现。")
+        if legacy:
+            print(f"  （日志里有 {legacy} 行旧格式记录，来自已退役的 Python 服务，已忽略——"
+                  "它们不能证明插件这次跑过）")
         print("  按可能性排序：")
         print("   1. 注入层没生效 —— asar 被 ZCode 升级覆盖了，重跑 tools/patch_zcode.py apply")
         print("   2. ZCode 未完全重启 —— 补丁要重启后才加载")
         print("   3. 信标上报仍在重试中 —— 注入脚本失败后会每 3s 重试（最多 20 次，约 60s）；")
         print("      若刚重启 ZCode，稍等片刻再查；用 --wait 60 可以让它自己等")
-        print(f"  读取路径：{log_path}（{source}）")
+        print(f"  读取路径：{LOG_PATH}（尚无信标）")
         return 1
 
-    print(f"收到 {len(events)} 条信标（来源：{source} · {log_path}）：")
+    print(f"收到 {len(events)} 条信标（{LOG_PATH}）：")
+    if legacy:
+        print(f"（另有 {legacy} 行旧格式记录来自已退役的 Python 服务，已忽略）")
     # 打印"最后 40 条"而不是"最早 40 条"：日志到 5MB 上限后最早的那批是几天前的，
     # 而下面要判断的是本次启动，打印旧会话内容会跟结论打架（实测很容易看串）。
     for ev in events[-40:]:
