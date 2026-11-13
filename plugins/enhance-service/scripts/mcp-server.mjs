@@ -94,14 +94,17 @@ function readToken() {
   try {
     return readFileSync(TOKEN_FILE, 'utf8').trim();
   } catch {
-    return ''; // 还没打过补丁（或用户删了），退回「只做 Origin 校验」的旧行为
+    return ''; // 还没打过补丁（或用户删了）
   }
 }
 
 // 启动时读一次作为兜底；请求时再重读（见 currentToken）。
 const STARTUP_TOKEN = readToken();
 if (!STARTUP_TOKEN) {
-  log(`⚠ 没有读到令牌文件 ${TOKEN_FILE}：浏览器来源的请求将只校验 Origin。`
+  // 措辞必须与真实行为一致：没有令牌时浏览器来源是**直接拒绝**（fail closed），
+  // 不是「只校验 Origin」。早先这句写反了，排查时会把人带到错误的方向。
+  log(`⚠ 没有读到令牌文件 ${TOKEN_FILE}：浏览器来源的请求将被直接拒绝（fail closed），`
+    + '只有不带 Origin 的本地调用仍可用。'
     + ' 先运行一次「修复增强提示词按钮.bat」的注入流程生成令牌。');
 }
 
@@ -391,16 +394,29 @@ async function callEnhance(ch, model, text) {
       max_tokens: 1200,
     },
   });
-  const content = data?.choices?.[0]?.message?.content;
+  const choice = data?.choices?.[0];
+  const content = choice?.message?.content;
   if (typeof content !== 'string') {
     throw new UpstreamError(`上游响应缺少 choices：${JSON.stringify(data).slice(0, 200)}`);
   }
-  return content;
+  // finish_reason 必须回传给调用方：'length' 表示 max_tokens 截断，
+  // 那是半截提示词，绝不能当成功结果写回输入框。
+  return { content, finishReason: String(choice?.finish_reason ?? '') };
 }
 
 // ------------------------------------------------------------------ 核心逻辑
 
 async function enhance(text, requestedModel = '') {
+  // 类型必须严格校验：`String(text ?? '')` 会把 {"a":1} 变成 "[object Object]" 发给模型，
+  // 既花了用户的 token，又返回一段「内容缺失」的废话，前端还当成功写回输入框。
+  if (text !== undefined && text !== null && typeof text !== 'string') {
+    return {
+      success: false,
+      text: '',
+      code: 'invalid_input',
+      error: `text 必须是字符串，收到的是 ${Array.isArray(text) ? 'array' : typeof text}`,
+    };
+  }
   const input = String(text ?? '').trim();
   if (!input) {
     return { success: false, text: '', code: 'empty_input', error: '请先输入需要增强的提示词' };
@@ -432,9 +448,15 @@ async function enhance(text, requestedModel = '') {
     const started = Date.now();
     try {
       const raw = await callEnhance(ch, model, input);
-      const { text: cleaned, removedMetaLines } = cleanResult(raw);
+      const { text: cleaned, removedMetaLines } = cleanResult(raw.content);
       if (!cleaned) {
         attempts.push({ channel: ch.name, code: 'llm_error', error: '模型返回空结果' });
+        continue;
+      }
+      // 被 max_tokens 截断的结果是半截提示词（可能停在半个列表项或半个句子上）。
+      // 与其把它写回输入框让用户以为增强成功，不如如实报错并保留草稿。
+      if (raw.finishReason === 'length') {
+        attempts.push({ channel: ch.name, code: 'truncated', error: '模型输出被 max_tokens 截断' });
         continue;
       }
       return {
@@ -614,8 +636,19 @@ function createHttpServer() {
       }
       if (req.method === 'POST' && url.pathname === '/api/enhance') {
         let body = {};
+        let rawBody;
         try {
-          body = JSON.parse((await readBody(req)) || '{}');
+          rawBody = await readBody(req);
+        } catch (err) {
+          // 请求体超限（413）等读失败必须保留原状态码：
+          // 早先这里和 JSON 解析共用一个 catch，超限被报成「请求体不是合法 JSON」，误导排查。
+          sendJson(res, err?.statusCode || 400, {
+            success: false, text: '', code: 'bad_request', error: err?.message ?? String(err),
+          }, cors);
+          return;
+        }
+        try {
+          body = JSON.parse(rawBody || '{}');
         } catch (err) {
           sendJson(res, 400, { success: false, text: '', code: 'unknown', error: `请求体不是合法 JSON：${err.message}` }, cors);
           return;
@@ -665,6 +698,10 @@ async function callTool(name, args) {
       pid: process.pid,
       port: servedPort(),
       listening: httpState.listening,
+      // 端口被占时前端要能区分「还没起来」和「被别的进程占着」，
+      // 否则用户看到的永远是一句「服务未响应」，无从下手。
+      retrying: httpState.retrying,
+      giveUp: httpState.giveUp,
       version: SERVER_VERSION,
       promptRoot: PROMPT_DIR,
       beaconLog: BEACON_LOG,
@@ -704,7 +741,7 @@ async function handleMessage(message) {
 
 // ------------------------------------------------------------------ 启动
 
-const httpState = { listening: false, server: null, port: null };
+const httpState = { listening: false, server: null, port: null, retrying: false, giveUp: null };
 
 /**
  * 实际监听端口。
@@ -715,27 +752,45 @@ function servedPort() {
   return httpState.port ?? PORT;
 }
 
-async function startHttp(fastRetries = 15, fastDelayMs = 20_000, slowDelayMs = 300_000) {
+// 端口被占时的退避节奏：先密集重试（覆盖「旧实例正在退出」这段过渡期），
+// 再逐步拉长。必须留上限——早先是无限期每 5 分钟重试一次，多开会话就会攒下一堆
+// 永远抢不到端口、却一直不退出的 node 进程（实测同一天 connect.started 18 次）。
+const PORT_RETRY_FAST = 15;
+const PORT_RETRY_FAST_MS = 2_000;
+const PORT_RETRY_SLOW_MS = 30_000;
+const PORT_RETRY_MAX_TRIES = 40; // 15×2s + 25×30s ≈ 13 分钟，足够覆盖重启/升级
+
+async function startHttp() {
   const attempt = (n) =>
     new Promise((resolve) => {
       const server = createHttpServer();
       httpState.server = server;
       server.once('error', (err) => {
         if (err.code === 'EADDRINUSE') {
-          // 端口被占不等于永久失败：可能是过渡期里旧的独立服务还没停，也可能是上个会话的僵尸。
-          // 先按 20s 密集重试，之后转为 5 分钟一次长期重试——不能"试够就放弃"，
-          // 否则一旦旧服务占着端口、而本进程已放弃，按钮要等到下次重启 ZCode 才会恢复。
-          const delay = n < fastRetries ? fastDelayMs : slowDelayMs;
+          if (n + 1 >= PORT_RETRY_MAX_TRIES) {
+            httpState.listening = false;
+            httpState.giveUp = 'EADDRINUSE';
+            log(`端口 ${PORT} 连续 ${PORT_RETRY_MAX_TRIES} 次被占用，停止重试。`
+              + ' 按钮会显示「服务未响应」；关掉占用该端口的进程后重启 ZCode 即可恢复。');
+            resolve();
+            return;
+          }
+          const delay = n < PORT_RETRY_FAST ? PORT_RETRY_FAST_MS : PORT_RETRY_SLOW_MS;
+          httpState.listening = false;
+          httpState.retrying = true;
           log(`端口 ${PORT} 被占用，${delay / 1000}s 后重试（第 ${n + 2} 次）`);
           const timer = setTimeout(() => resolve(attempt(n + 1)), delay);
           timer.unref?.(); // 等待重试不该阻止进程退出
           return;
         }
+        httpState.listening = false;
         log(`HTTP 启动失败：${err.message}（按钮将无法工作）`);
         resolve();
       });
       server.listen(PORT, '127.0.0.1', () => {
         httpState.listening = true;
+        httpState.retrying = false;
+        httpState.giveUp = null;
         httpState.port = server.address()?.port ?? PORT;
         log(`HTTP 已监听 http://127.0.0.1:${servedPort()}（pid=${process.pid}）`);
         resolve();

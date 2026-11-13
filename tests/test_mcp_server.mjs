@@ -51,7 +51,7 @@ function raw(port, path, { method = 'GET', headers = {}, body = null } = {}) {
 
 // ------------------------------------------------------------------ 模拟上游
 
-const mock = { content: '增强后的提示词', status: 200, seen: [], down: false };
+const mock = { content: '增强后的提示词', status: 200, seen: [], down: false, finishReason: 'stop' };
 const mockServer = createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
@@ -70,7 +70,7 @@ const mockServer = createServer((req, res) => {
     if (req.url === '/v1/chat/completions') {
       res.writeHead(mock.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(mock.status === 200
-        ? { choices: [{ message: { content: mock.content } }] }
+        ? { choices: [{ message: { content: mock.content }, finish_reason: mock.finishReason }] }
         : { error: { message: '上游炸了' } }));
       return;
     }
@@ -239,6 +239,34 @@ mock.seen.length = 0;
   mock.content = '啊'.repeat(900);
   const r = await mod.enhance('草稿');
   check('超 800 字打标记', r.success === true && r.overLength === true);
+}
+
+// ---- finish_reason='length'（max_tokens 截断）不能当成功 ----
+// 截断的结果是半截提示词，写回输入框会让用户以为增强成功，实际拿到半句话。
+{
+  mock.content = '请分析这段代码的主要功能、执行流程';
+  mock.finishReason = 'length';
+  const r = await mod.enhance('帮我看看代码');
+  check('finish_reason=length → 失败，不写回半截结果',
+    r.success === false && r.text === '' && r.code === 'truncated',
+    JSON.stringify(r).slice(0, 140));
+  mock.finishReason = 'stop';
+  const ok = await mod.enhance('帮我看看代码');
+  check('finish_reason=stop → 正常成功', ok.success === true && ok.text.length > 0);
+}
+
+// ---- 非字符串 text 必须被拒，不能把 "[object Object]" 发给模型 ----
+{
+  mock.seen.length = 0;
+  const r = await mod.enhance({ a: 1 });
+  check('text 传对象 → invalid_input 且不打上游',
+    r.success === false && r.code === 'invalid_input' && mock.seen.length === 0,
+    `code=${r.code} calls=${mock.seen.length}`);
+  const r2 = await mod.enhance(123);
+  check('text 传数字 → invalid_input', r2.success === false && r2.code === 'invalid_input', r2.code);
+  const r3 = await mod.enhance(null);
+  check('text 传 null → empty_input（不是 invalid_input）',
+    r3.success === false && r3.code === 'empty_input', r3.code);
 }
 
 // ------------------------------------------------------------------ 4. 真实子进程：MCP + HTTP + 生命周期
@@ -436,6 +464,33 @@ check('健康检查里能看到通道', (healthy?.channels ?? []).some((c) => c.
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'x'.repeat(200 * 1024),
   });
   check('超大请求体 → 413', res.status === 413, `status=${res.status}`);
+}
+{
+  // /api/enhance 的超限必须也是 413，且不能被报成「请求体不是合法 JSON」：
+  // 早先两个错误共用一个 catch，413 被降级成 400，排查时完全指错方向。
+  const res = await raw(PORT, '/api/enhance', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: 'x'.repeat(300 * 1024) }),
+  });
+  const body = JSON.parse(res.body || '{}');
+  check('/api/enhance 超大请求体 → 413（不是 400）', res.status === 413, `status=${res.status}`);
+  check('/api/enhance 超限报错不再谎称 JSON 非法',
+    body.code === 'bad_request' && !String(body.error || '').includes('不是合法 JSON'),
+    JSON.stringify(body).slice(0, 120));
+}
+{
+  // 非字符串 text 必须被拒，而不是把 "[object Object]" 当草稿发给模型（会真花钱）。
+  mock.seen.length = 0;
+  const res = await raw(PORT, '/api/enhance', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: { a: 1 } }),
+  });
+  const body = JSON.parse(res.body || '{}');
+  check('HTTP 传对象 text → invalid_input 且不打上游',
+    body.success === false && body.code === 'invalid_input' && mock.seen.length === 0,
+    `code=${body.code} calls=${mock.seen.length}`);
 }
 
 // 生命周期：stdin 关闭 = 宿主退出 → 进程必须自己结束
