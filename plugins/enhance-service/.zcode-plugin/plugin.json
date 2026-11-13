@@ -1,6 +1,6 @@
 {
   "name": "enhance-service",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "把「增强提示词」的模型调用挂进 ZCode 生命周期：随 ZCode 启动，随 ZCode 退出终止；同时在本机 127.0.0.1:8770 提供 HTTP 接口供输入框下方的按钮调用。",
   "author": {
     "name": "local"

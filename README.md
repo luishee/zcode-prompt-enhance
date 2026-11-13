@@ -12,7 +12,7 @@
 └──────────────────────────────────────────────────────┘
 ```
 
-> **平台**：Windows 10/11。实测环境 ZCode 3.18.0 + Python 3.15 + Node 24。
+> **平台**：Windows 10/11。实测环境 ZCode 3.18.2 + Python 3.15 + Node 24。
 > 注入层需要改 ZCode 的 `app.asar`，每次 ZCode 升级后要重新注入一次（一条命令 / 双击 `.bat` 选 1）。
 
 ## 快速开始（3 步）
@@ -155,9 +155,20 @@ ZCode 渲染层（file:// 加载 index.html）
 
 ### 为什么模型能「跟随 ZCode 当前选择」
 
-渲染层读不到凭据，所以由服务读 ZCode 的 provider 配置（内含 baseUrl / apiKey / 模型列表），
-这等价于「用 ZCode 当前在用的模型」。前端另外会把**真实请求体里的 model 抓出来**一并带上
-（比读界面上的显示名更准），最终由服务统一归一成上游认识的模型 id（先按 id 匹配，再按显示名匹配）。
+渲染层读不到凭据，所以由服务读 ZCode 的 provider 配置（内含 baseUrl / apiKey / 模型列表）。
+**具体用哪个模型**由前端决定，三条来源按可靠度排序：
+
+| 来源 | 取值 | 可靠性 |
+| --- | --- | --- |
+| `[data-model-current-value]` | `providerId/modelId`，取第一个 `/` 之后的部分 | **主路径**：模型选择器 trigger 上的属性，收起态也存在 |
+| 拦截 `window.fetch` 抓请求体里的 `model` | 真实 model id | 次选：ZCode 的模型请求走主进程，渲染层多半抓不到 |
+| `[data-composer-open-label]` | 显示名 | 彩蛋：只在弹出层展开时渲染，收起态不存在 |
+
+早先只用了后两条，结果两条都不命中（实测 43/43 次 `composer-seen` 都是 `hasModelLabel:false`），
+「跟随当前模型」实际没生效，只是碰巧通道只配了一个模型才没暴露。
+现在 `check_beacon` 会单独报告模型锚点是否命中，见「诊断」一节。
+
+服务端再把前端传来的值归一成上游认识的模型 id（先按 id 匹配，再按显示名匹配）。
 
 ### 从 WorkBuddy 逆向到的真实契约（2026-11-09 实测）
 
@@ -169,15 +180,22 @@ ZCode 渲染层（file:// 加载 index.html）
 | 入参 | `{text, model?, sessionId?}` | `{text, model?}` |
 | 中断 | 错误标识 `enhance-prompt-aborted-by-user` | 前端 `AbortController` |
 | 空输入 | 错误码 `empty_input` | 同 |
+| 入参类型错误 | — | `invalid_input`（`text` 不是字符串时直接拒，不打上游） |
 | 端点不可用 | 错误码 `sidecar_unavailable` | `upstream_unavailable` |
 | 模型失败 | 错误码 `llm_error` | 同 |
+| 输出被截断 | — | `truncated`（上游 `finish_reason=length`，不把半截结果当成功） |
 | 结果清洗 | `stripWrappingQuotes`（剥首尾 `" ' “ ” ‘ ’`） | 同，另加围栏与标签处理 |
-| 默认模型 | 不传则跟随会话当前模型 | 同（自动探测） |
+| 默认模型 | 不传则跟随会话当前模型 | 同（读 `data-model-current-value`） |
 | UI 文案 | `input.enhance.title` / `enhancing` / `revert` | 对齐 ZCode 自带 `chat.promptEnhance.*` |
 
 **语言一致性是它的最高优先级约束**，并且专门给了坏例子
 （`User input is in Chinese → Response must be in Chinese.` 这种把语言判定写进结果的错误）。
 `plugins/enhance-service/prompts/enhance_user.txt` 原样保留这些约束与 few-shot。
+
+两份提示词（`enhance_system.txt` + `enhance_user.txt`）会**同时**生效，所以它们不能互相打架：
+早期 system 里写了「不要建议用户没提到的技术」，但它自己的 few-shot 例子却在指定 Next.js 和页面结构，
+实测于是「写个爬虫」会变成「请用 **Python** 编写…」、「写个登录页面」会变成「如原生 HTML/CSS/JavaScript 或 **React**」。
+现在两份都收敛到同一条口径：**不替用户选技术栈、不补用户没要的功能、保持紧凑（远低于 800 字）**。
 
 ---
 
@@ -186,7 +204,7 @@ ZCode 渲染层（file:// 加载 index.html）
 | 项 | 要求 | 用途 |
 | --- | --- | --- |
 | 操作系统 | Windows 10/11 | 注入 `app.asar`；`.bat` 维护入口 |
-| ZCode 桌面版 | 实测 3.17.2 / 3.18.0 | 被注入的目标 |
+| ZCode 桌面版 | 实测 3.17.2 / 3.18.0 / 3.18.2 | 被注入的目标 |
 | Python | 3.10+（实测 3.15） | `tools/*.py`、`.bat` 菜单 |
 | Node.js | 18+（实测 24） | 插件里的 MCP server（由 ZCode 拉起） |
 | 浏览器 | Chrome 或 Edge | 仅做 DOM 自测时需要 |
@@ -327,7 +345,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | --- | --- | --- |
 | `/api/health` | GET | 服务与通道状态（含 `tokenRequired`） |
 | `/api/models` | GET | 模型列表（`source: upstream` 表示真的从上游取到了） |
-| `/api/enhance` | POST | `{text, model?}` → `{success, text, model, channel, elapsedMs, removedMetaLines, maxLength, overLength}`；草稿超 8000 字返回 `code: input_too_long` |
+| `/api/enhance` | POST | `{text, model?}` → `{success, text, model, channel, elapsedMs, removedMetaLines, maxLength, overLength}`；草稿超 8000 字返回 `code: input_too_long`；`text` 不是字符串返回 `code: invalid_input`；上游 `finish_reason=length` 返回 `code: truncated`（不写回半截结果）；请求体超 256KB 返回 **413** |
 | `/api/beacon` | POST | 注入脚本上报诊断信标（写 `%LOCALAPPDATA%\zcode-prompt-enhance\beacon.log`，单行 JSON、5MB 轮转） |
 
 > **谁能调这些接口**：只接受本机来源。不带 `Origin` 的命令行调用（上面的 PowerShell 示例）直接可用；
@@ -477,12 +495,12 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `python tools/verify_patch.py --original <备份> --patched <asar>` | 全量逐字节校验（实测约 3.18 万文件） |
 | `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步（只读插件格式、只统计本次启动） |
 | `python tools/check_beacon.py --purge-legacy` | 物理删除日志里 Python 时代的旧格式行（只留插件格式），再照常分析 |
-| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 32 项 DOM 断言 |
-| `node tests/test_mcp_server.mjs` | 插件服务测试（72 项，含生命周期、端口冲突、令牌热更新） |
+| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 34 项 DOM 断言 |
+| `node tests/test_mcp_server.mjs` | 插件服务测试（80 项，含生命周期、端口冲突、令牌热更新、截断/类型校验） |
 | `python tests/test_patch_zcode.py` | asar 写入层测试（46 项：apply/幂等/刷新/还原/无基线保护） |
 | `python tests/test_entry_bat.py` | 入口 `.bat` 契约测试（35 项：编码/换行约定、退出码、参数透传与演练文案，不碰 ZCode） |
 | `python tests/test_plugin_manifest.py` | 插件清单契约测试（13 项：`plugin.json`/`.mcp.json`/变量名/脚本与 prompts 是否真的存在） |
-| `python tests/test_check_beacon.py` | 信标解析测试（13 项：只读插件格式、忽略旧格式、BOM/损坏行/缓存失效、purge 幂等） |
+| `python tests/test_check_beacon.py` | 信标解析测试（18 项：只读插件格式、忽略旧格式、BOM/损坏行/缓存失效、purge 幂等、模型锚点判定） |
 | `python tools/menu.py [apply\|status\|check\|restore]` | `.bat` 的实际实现，也可直接调（`-h` 看用法） |
 
 `--asar` / `--backup` / `--endpoint` 三个选项可以透传给 `.bat`（写在动作之后，选项在子命令之前）：
@@ -609,7 +627,7 @@ python "<项目目录>\tools\patch_zcode.py" restore
 | 信标 | 含义 |
 | --- | --- |
 | `boot` | 脚本已加载，附 `composers`（此时页面上找到的 composer 数量） |
-| `composer-seen` | 找到了 composer，附 `hasActions` / `hasEditor` / `hasModelLabel` |
+| `composer-seen` | 找到了 composer，附 `hasActions` / `hasEditor` / `hasModelValue` / `hasModelLabel` / `modelFromDom` |
 | `attached` | 按钮已挂上，附挂载点 class |
 | `attach-failed` | 找到了 composer 但锚点失配 |
 | `write-ok` / `write-failed` | 写回编辑器的结果，失败时附尝试过的策略与长度 |
@@ -630,11 +648,31 @@ python tools/check_beacon.py --purge-legacy
 临时文件 + `os.replace` 原子替换，可反复执行（第二次起提示「无需清理」）。
 建议在 ZCode 退出时跑，避免清理期间新写入的信标被覆盖。
 
+### 按钮挂上了，但换模型不跟随
+
+这种情况按钮和增强都「看起来正常」，只是永远用通道默认模型。`check_beacon.py` 会单独给结论：
+
+```
+✓ 模型锚点命中：deepseek-flash（增强会用 ZCode 当前选择的模型）
+✗ 没找到 data-model-current-value：增强会回落到通道默认模型，
+  表现为「在界面里换模型后增强不跟随」。
+  → 需要按当前 DOM 更新 SEL.modelValue 选择器
+✗ data-model-current-value 存在但值为空：增强会回落到通道默认模型。
+  → 检查 SEL.modelValue 的取值解析（providerId/modelId 应按第一个 / 切分）
+```
+
+`composer-seen` 信标里两个锚点分开上报（`hasModelValue` / `hasModelLabel`），
+混在一起就看不出是哪一个失效了。
+
 ### 按钮在，但点了报错
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | `提示词增强失败：Failed to fetch · 增强服务未响应…` | 插件没跑 / 端口没监听 | 查 `mcp-server.mjs` 进程与 `/api/health`；确认插件已启用；重启 ZCode |
+| 同上，且刚重启过 ZCode | 旧实例还占着 8770，新实例在退避重试（最长约 13 分钟） | 等一会儿再试；或结束占端口的 node 进程。`enhance_service_status` 工具会报 `retrying: true` |
+| `truncated` | 上游输出被 `max_tokens` 截断 | 精简草稿后重试；这是刻意不写回半截结果 |
+| `invalid_input` | `text` 不是字符串（前端 bug） | 检查调用方是否把对象/数字当草稿传了 |
+| 换模型后增强仍用旧模型 | 模型锚点 `[data-model-current-value]` 失配 | 跑 `check_beacon.py`，它会明确指出锚点是否命中 |
 | `upstream_unavailable` | 通道 A 读不到配置且没有通道 B | 配 `plugins/enhance-service/config.json` 或检查 `~/.zcode/v2/provider_config.json` |
 | `llm_error` + HTTP 401/403 | key 失效 | 在 ZCode 里重新登录/配置 provider，或改用通道 B |
 | `llm_error` + 模型不存在 | 模型名没归一上 | 响应里带 `model`，检查该上游是否真的提供这个 id |
@@ -680,7 +718,7 @@ zcode-prompt-enhance/
 │   ├─ run_dom_test.py             无头浏览器 DOM 自测
 │   └─ menu.py                     维护菜单（.bat 的实际内容）
 ├─ tests/
-│   ├─ test_mcp_server.mjs         插件服务测试（72 项，含生命周期与令牌热更新）
+│   ├─ test_mcp_server.mjs         插件服务测试（80 项，含生命周期、令牌热更新与截断校验）
 │   ├─ test_patch_zcode.py         asar 写入层测试（46 项，用合成小包）
 │   ├─ test_entry_bat.py           入口 .bat 契约测试（编码/换行、退出码、参数转发）
 │   ├─ test_plugin_manifest.py     插件清单契约测试（变量名/脚本/prompts 是否可用）
@@ -696,11 +734,11 @@ zcode-prompt-enhance/
 ## 开发与测试
 
 ```powershell
-# 插件服务测试：MCP 握手、tools/call、HTTP、端口冲突、令牌热更新、stdin 关闭即退出（72 项）
+# 插件服务测试：MCP 握手、tools/call、HTTP、端口冲突、令牌热更新、截断/类型校验、stdin 关闭即退出（80 项）
 node tests/test_mcp_server.mjs
 
 # 注入脚本 DOM 自测：按钮位置、type=button、空输入、写回、还原、失败保草稿、
-# 官方 API 优先、写回全失败的信标（32 项，需要 Chrome/Edge）
+# 官方 API 优先、写回全失败的信标、模型锚点优先级（34 项，需要 Chrome/Edge）
 python tools/run_dom_test.py
 
 # asar 写入层测试：在临时目录里合成小包，跑 apply / 幂等 / 刷新 / --out / restore /
@@ -717,7 +755,7 @@ python tests/test_entry_bat.py
 python tests/test_plugin_manifest.py
 
 # 信标解析测试：只读插件格式（纯 JSON）、忽略 Python 时代旧格式、BOM/损坏行/缓存失效、
-# purge 只删旧格式且幂等（13 项）
+# purge 只删旧格式且幂等、模型锚点判定（18 项）
 python tests/test_check_beacon.py
 
 # 全量逐字节校验（需先拿到原始备份）
