@@ -10,6 +10,7 @@
   .stage { max-width: 720px; }
   /* 下面这段刻意模仿 ZCode composer 的类名与布局 */
   form { margin: 0; }
+  .toolbar-outside { display: flex; flex-direction: column; gap: 8px; }
   [data-composer-layout] {
     display: flex; flex-direction: column; gap: 12px;
     padding: 12px; background: #fff;
@@ -45,20 +46,23 @@
      用来在不打补丁的前提下验证按钮与交互。</p>
 
   <form id="theForm">
-    <div data-composer-layout>
-      <div class="editor" id="editor" data-lexical-editor="true" contenteditable="true"
-           data-placeholder="随便写一句草稿，然后点下面的增强按钮"></div>
-      <div class="toolbar">
-        <div data-composer-leading-actions>
-          <div data-composer-leading-content>
-            <button type="button" class="chip">＋</button>
-            <!-- 模型选择器 trigger：data-model-current-value 是 "providerId/modelId"，
-                 收起态也存在（ZCode 里 data-composer-open-label 只在弹出层展开时才渲染）。 -->
-            <button type="button" class="chip" data-model-current-value="deepseek-GO/DeepSeek-V4.1-Flash">DeepSeek-V4.1-Flash</button>
+    <!-- 真实 ZCode 的结构：模型选择器在 chat toolbar 里，是 [data-composer-layout] 的**兄弟**节点，
+         不在 composer 子树内。注入脚本因此是逐级向上找含锚点的祖先。 -->
+    <div class="toolbar-outside">
+      <span data-testid="v4-model-config" data-model="deepseek-flash" hidden></span>
+      <div data-composer-layout>
+        <div class="editor" id="editor" data-lexical-editor="true" contenteditable="true"
+             data-placeholder="随便写一句草稿，然后点下面的增强按钮"></div>
+        <div class="toolbar">
+          <div data-composer-leading-actions>
+            <div data-composer-leading-content>
+              <button type="button" class="chip">＋</button>
+            </div>
           </div>
+          <div data-composer-trailing-actions><button type="submit">发送</button></div>
         </div>
-        <div data-composer-trailing-actions><button type="submit">发送</button></div>
       </div>
+      <button type="button" class="chip" data-model-current-value="deepseek-GO/DeepSeek-V4.1-Flash">DeepSeek-V4.1-Flash</button>
     </div>
   </form>
 

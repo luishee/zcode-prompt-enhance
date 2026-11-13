@@ -111,15 +111,17 @@
 
   // ---------------------------------------------------------------- 模型探测
   //
-  // 三条来源，按可靠度排序：
-  //   1. [data-model-current-value]：模型选择器 trigger 上的属性，值是 "providerId/modelId"，
-  //      收起态也存在 —— 这是实测唯一稳定的界面锚点。
-  //   2. fetch 钩子抓到的真实请求体（最准，但只在 ZCode 自己发请求时才有）。
-  //   3. [data-composer-open-label]：只在弹出层展开时渲染，只能算彩蛋，不能当主路径。
+  // 锚点在哪：ZCode 的模型选择器属于 chat toolbar，是 [data-composer-layout] 的**兄弟**节点，
+  // 不在 composer 子树里（实测：composer.querySelector 一律拿不到）。
+  // 所以这里从 composer 逐级向上，找「最近的、包含模型锚点的祖先」，再在那一层里取。
+  // 逐级向上而不是直接 document.querySelector：多输入框（侧边会话）时不会串到别的会话上。
   //
-  // 早先只用了 2 和 3，结果两条都不命中：ZCode 的模型请求走主进程（out/host），
-  // 渲染层的 window.fetch 根本看不到；而 3 的属性在收起态不存在（beacon 里
-  // 43/43 次 composer-seen 都是 hasModelLabel:false）。于是"跟随当前模型"实际没生效。
+  // 三个锚点按可靠度：
+  //   1. [data-testid="v4-model-config"][data-model]：隐藏遥测 span，data-model 直接就是模型 id；
+  //   2. [data-model-current-value]：选择器 trigger，值形如 "providerId/modelId"；
+  //   3. [data-composer-open-label]：只在弹出层展开时渲染，只能兜底。
+  const MODEL_CONFIG_SEL = '[data-testid="v4-model-config"][data-model]';
+
   let lastRequestModel = '';
   let lastRequestAt = 0;
   let lastModelLabel = '';
@@ -151,35 +153,58 @@
   // 否则「切了模型但还没发过消息」时，第一次增强会用上一个模型。
   const MODEL_CAPTURE_TTL_MS = 10 * 60_000;
 
+  /** 从 composer 往上找最近一层包含模型锚点的容器；找不到返回 null。 */
+  function modelScope(composer) {
+    let node = composer || document.documentElement;
+    while (node) {
+      try {
+        if (node.querySelector?.(MODEL_CONFIG_SEL) || node.querySelector?.(SEL.modelValue)) return node;
+      } catch {
+        /* ignore */
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
   /**
-   * 读界面上的模型值。
-   * `data-model-current-value` 是 "providerId/modelId" 形式（providerId 里本身不带 "/"），
-   * 所以按第一个 "/" 切分取后半段就是上游认识的 model id；没有 "/" 时整串就是 model id。
+   * 读界面上的模型值，并回报命中的是哪个锚点。
+   * 回报 anchor 是为了让 check_beacon 能区分「锚点缺失」和「属性存在但值为空」——
+   * 这两种失败的处理方式完全不同，混在一起就只剩一句「不跟随」，无从下手。
    */
-  function readModelFromDom(composer) {
-    const scope = composer || document;
-    let value = '';
+  function readModelAnchor(composer) {
+    const scope = modelScope(composer);
+    if (!scope) return { model: '', anchor: '' };
     try {
-      const el = scope.querySelector(SEL.modelValue);
-      value = (el?.getAttribute('data-model-current-value') || '').trim();
+      const cfg = scope.querySelector(MODEL_CONFIG_SEL);
+      const raw = (cfg?.getAttribute('data-model') || '').trim();
+      if (raw && raw !== '<synthetic>') return { model: raw, anchor: 'config' };
     } catch {
       /* ignore */
     }
-    if (value && value !== '<synthetic>') {
-      const slash = value.indexOf('/');
-      const modelId = slash > 0 ? value.slice(slash + 1).trim() : value;
-      if (modelId) return modelId;
+    try {
+      const el = scope.querySelector(SEL.modelValue);
+      const value = (el?.getAttribute('data-model-current-value') || '').trim();
+      if (value && value !== '<synthetic>') {
+        // "providerId/modelId"：providerId 本身不带 "/"，按第一个切分取后半段
+        const slash = value.indexOf('/');
+        const modelId = slash > 0 ? value.slice(slash + 1).trim() : value;
+        if (modelId) return { model: modelId, anchor: 'value' };
+      }
+    } catch {
+      /* ignore */
     }
-    // 兜底：弹出层展开时的显示名（可能被截断，只能算次选）
     try {
       const label = (scope.querySelector(SEL.modelLabel)?.textContent || '').trim();
       // 可能是 "DeepSeek-V4.1-Flash · 经济模式" 这类复合文案，取首段
-      if (label) return label.split(/[·|｜]/)[0].trim();
+      if (label) return { model: label.split(/[·|｜]/)[0].trim(), anchor: 'label' };
     } catch {
       /* ignore */
     }
-    return '';
+    return { model: '', anchor: '' };
   }
+
+  const readModelFromDom = (composer) => readModelAnchor(composer).model;
 
   function currentModel(composer) {
     const fromDom = readModelFromDom(composer);
@@ -727,14 +752,17 @@
       }, true);
 
       // 首次接手时上报诊断，便于判断按钮到底卡在哪一步
+      const anchor = readModelAnchor(composer);
       beacon('composer-seen', {
         hasActions: !!composer.querySelector(SEL.actions),
         hasEditor: !!findEditor(composer),
-        // 两个模型锚点分开报：modelValue 是主路径（收起态也在），
-        // modelLabel 只在弹出层展开时才有，只能算彩蛋。混在一起会看不出哪个失效。
-        hasModelValue: !!composer.querySelector(SEL.modelValue),
+        // 三个锚点分开报：混在一起就看不出是哪一个失效了，
+        // 而三种失效的处理方式完全不同（见 check_beacon 的结论分支）。
+        hasModelConfig: !!modelScope(composer)?.querySelector?.(MODEL_CONFIG_SEL),
+        hasModelValue: !!modelScope(composer)?.querySelector?.(SEL.modelValue),
         hasModelLabel: !!composer.querySelector(SEL.modelLabel),
-        modelFromDom: readModelFromDom(composer),
+        modelAnchor: anchor.anchor,
+        modelFromDom: anchor.model,
         composerAttrs: Array.from(composer.attributes).map((a) => a.name).join(','),
       });
     }

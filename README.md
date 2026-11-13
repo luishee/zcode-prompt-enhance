@@ -156,16 +156,22 @@ ZCode 渲染层（file:// 加载 index.html）
 ### 为什么模型能「跟随 ZCode 当前选择」
 
 渲染层读不到凭据，所以由服务读 ZCode 的 provider 配置（内含 baseUrl / apiKey / 模型列表）。
-**具体用哪个模型**由前端决定，三条来源按可靠度排序：
+**具体用哪个模型**由前端决定，三个界面锚点按可靠度排序：
 
 | 来源 | 取值 | 可靠性 |
 | --- | --- | --- |
-| `[data-model-current-value]` | `providerId/modelId`，取第一个 `/` 之后的部分 | **主路径**：模型选择器 trigger 上的属性，收起态也存在 |
-| 拦截 `window.fetch` 抓请求体里的 `model` | 真实 model id | 次选：ZCode 的模型请求走主进程，渲染层多半抓不到 |
-| `[data-composer-open-label]` | 显示名 | 彩蛋：只在弹出层展开时渲染，收起态不存在 |
+| `[data-testid="v4-model-config"][data-model]` | 直接就是上游 model id | **主路径**：隐藏的遥测 span，不需要解析 |
+| `[data-model-current-value]` | `providerId/modelId`，取第一个 `/` 之后的部分 | 次选：模型选择器 trigger，收起态也在 |
+| `[data-composer-open-label]` | 显示名 | 兜底：只在弹出层展开时渲染，id 可能对不上 |
 
-早先只用了后两条，结果两条都不命中（实测 43/43 次 `composer-seen` 都是 `hasModelLabel:false`），
-「跟随当前模型」实际没生效，只是碰巧通道只配了一个模型才没暴露。
+**锚点不在 composer 里**：模型选择器属于 chat toolbar，是 `[data-composer-layout]` 的**兄弟**节点。
+注入脚本因此从 composer 逐级向上，找「最近一层包含锚点的祖先」再取——逐级向上而不是
+`document.querySelector`，多输入框（侧边会话）时才不会串到别的会话上。
+这一条踩过：只查 `composer.querySelector` 时，信标里 `hasModelValue` 恒为 `false`。
+
+再往下还有一条降级：拦截 `window.fetch` 抓请求体里的 `model`。ZCode 的模型请求走主进程
+（`out/host`），渲染层通常抓不到，所以它只是兜底，不能当主路径。
+
 现在 `check_beacon` 会单独报告模型锚点是否命中，见「诊断」一节。
 
 服务端再把前端传来的值归一成上游认识的模型 id（先按 id 匹配，再按显示名匹配）。
@@ -185,7 +191,7 @@ ZCode 渲染层（file:// 加载 index.html）
 | 模型失败 | 错误码 `llm_error` | 同 |
 | 输出被截断 | — | `truncated`（上游 `finish_reason=length`，不把半截结果当成功） |
 | 结果清洗 | `stripWrappingQuotes`（剥首尾 `" ' “ ” ‘ ’`） | 同，另加围栏与标签处理 |
-| 默认模型 | 不传则跟随会话当前模型 | 同（读 `data-model-current-value`） |
+| 默认模型 | 不传则跟随会话当前模型 | 同（读 `data-model` / `data-model-current-value`） |
 | UI 文案 | `input.enhance.title` / `enhancing` / `revert` | 对齐 ZCode 自带 `chat.promptEnhance.*` |
 
 **语言一致性是它的最高优先级约束**，并且专门给了坏例子
@@ -495,12 +501,12 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `python tools/verify_patch.py --original <备份> --patched <asar>` | 全量逐字节校验（实测约 3.18 万文件） |
 | `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步（只读插件格式、只统计本次启动） |
 | `python tools/check_beacon.py --purge-legacy` | 物理删除日志里 Python 时代的旧格式行（只留插件格式），再照常分析 |
-| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 34 项 DOM 断言 |
+| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 36 项 DOM 断言 |
 | `node tests/test_mcp_server.mjs` | 插件服务测试（80 项，含生命周期、端口冲突、令牌热更新、截断/类型校验） |
 | `python tests/test_patch_zcode.py` | asar 写入层测试（46 项：apply/幂等/刷新/还原/无基线保护） |
 | `python tests/test_entry_bat.py` | 入口 `.bat` 契约测试（35 项：编码/换行约定、退出码、参数透传与演练文案，不碰 ZCode） |
 | `python tests/test_plugin_manifest.py` | 插件清单契约测试（13 项：`plugin.json`/`.mcp.json`/变量名/脚本与 prompts 是否真的存在） |
-| `python tests/test_check_beacon.py` | 信标解析测试（18 项：只读插件格式、忽略旧格式、BOM/损坏行/缓存失效、purge 幂等、模型锚点判定） |
+| `python tests/test_check_beacon.py` | 信标解析测试（21 项：只读插件格式、忽略旧格式、BOM/损坏行/缓存失效、purge 幂等、模型锚点四分支判定） |
 | `python tools/menu.py [apply\|status\|check\|restore]` | `.bat` 的实际实现，也可直接调（`-h` 看用法） |
 
 `--asar` / `--backup` / `--endpoint` 三个选项可以透传给 `.bat`（写在动作之后，选项在子命令之前）：
@@ -627,7 +633,7 @@ python "<项目目录>\tools\patch_zcode.py" restore
 | 信标 | 含义 |
 | --- | --- |
 | `boot` | 脚本已加载，附 `composers`（此时页面上找到的 composer 数量） |
-| `composer-seen` | 找到了 composer，附 `hasActions` / `hasEditor` / `hasModelValue` / `hasModelLabel` / `modelFromDom` |
+| `composer-seen` | 找到了 composer，附 `hasActions` / `hasEditor` / `hasModelConfig` / `hasModelValue` / `hasModelLabel` / `modelAnchor` / `modelFromDom` |
 | `attached` | 按钮已挂上，附挂载点 class |
 | `attach-failed` | 找到了 composer 但锚点失配 |
 | `write-ok` / `write-failed` | 写回编辑器的结果，失败时附尝试过的策略与长度 |
@@ -653,16 +659,20 @@ python tools/check_beacon.py --purge-legacy
 这种情况按钮和增强都「看起来正常」，只是永远用通道默认模型。`check_beacon.py` 会单独给结论：
 
 ```
-✓ 模型锚点命中：deepseek-flash（增强会用 ZCode 当前选择的模型）
-✗ 没找到 data-model-current-value：增强会回落到通道默认模型，
+✓ 模型锚点命中：deepseek-flash（来源 data-testid=v4-model-config）
+✓ 模型锚点命中：glm-5.3-flash（来源 data-model-current-value）
+△ 模型锚点只命中显示名：DeepSeek-V4.1-Flash（来源 data-composer-open-label（显示名））
+  显示名可能被截断或与上游 id 不一致；能命中 data-model 时优先用它。
+✗ 模型锚点存在但取不到值：增强会回落到通道默认模型。
+  锚点存在情况：v4-model-config=True current-value=True open-label=False
+  → 检查取值解析（data-model 直接用；data-model-current-value 应按第一个 / 切分）
+✗ 三个模型锚点都没找到：增强会回落到通道默认模型，
   表现为「在界面里换模型后增强不跟随」。
-  → 需要按当前 DOM 更新 SEL.modelValue 选择器
-✗ data-model-current-value 存在但值为空：增强会回落到通道默认模型。
-  → 检查 SEL.modelValue 的取值解析（providerId/modelId 应按第一个 / 切分）
+  → 锚点通常在 chat toolbar（composer 的兄弟节点），确认 modelScope 的向上查找范围
 ```
 
-`composer-seen` 信标里两个锚点分开上报（`hasModelValue` / `hasModelLabel`），
-混在一起就看不出是哪一个失效了。
+`composer-seen` 信标里三个锚点分开上报（`hasModelConfig` / `hasModelValue` / `hasModelLabel`）
+外加实际命中的 `modelAnchor` 与 `modelFromDom`，混在一起就看不出是哪一个失效了。
 
 ### 按钮在，但点了报错
 
@@ -672,7 +682,7 @@ python tools/check_beacon.py --purge-legacy
 | 同上，且刚重启过 ZCode | 旧实例还占着 8770，新实例在退避重试（最长约 13 分钟） | 等一会儿再试；或结束占端口的 node 进程。`enhance_service_status` 工具会报 `retrying: true` |
 | `truncated` | 上游输出被 `max_tokens` 截断 | 精简草稿后重试；这是刻意不写回半截结果 |
 | `invalid_input` | `text` 不是字符串（前端 bug） | 检查调用方是否把对象/数字当草稿传了 |
-| 换模型后增强仍用旧模型 | 模型锚点 `[data-model-current-value]` 失配 | 跑 `check_beacon.py`，它会明确指出锚点是否命中 |
+| 换模型后增强仍用旧模型 | 模型锚点失配（锚点在 chat toolbar，不在 composer 内） | 跑 `check_beacon.py`，它会指出三个锚点各自的命中情况 |
 | `upstream_unavailable` | 通道 A 读不到配置且没有通道 B | 配 `plugins/enhance-service/config.json` 或检查 `~/.zcode/v2/provider_config.json` |
 | `llm_error` + HTTP 401/403 | key 失效 | 在 ZCode 里重新登录/配置 provider，或改用通道 B |
 | `llm_error` + 模型不存在 | 模型名没归一上 | 响应里带 `model`，检查该上游是否真的提供这个 id |
@@ -738,7 +748,7 @@ zcode-prompt-enhance/
 node tests/test_mcp_server.mjs
 
 # 注入脚本 DOM 自测：按钮位置、type=button、空输入、写回、还原、失败保草稿、
-# 官方 API 优先、写回全失败的信标、模型锚点优先级（34 项，需要 Chrome/Edge）
+# 官方 API 优先、写回全失败的信标、模型锚点优先级与兄弟节点查找（36 项，需要 Chrome/Edge）
 python tools/run_dom_test.py
 
 # asar 写入层测试：在临时目录里合成小包，跑 apply / 幂等 / 刷新 / --out / restore /
@@ -755,7 +765,7 @@ python tests/test_entry_bat.py
 python tests/test_plugin_manifest.py
 
 # 信标解析测试：只读插件格式（纯 JSON）、忽略 Python 时代旧格式、BOM/损坏行/缓存失效、
-# purge 只删旧格式且幂等、模型锚点判定（18 项）
+# purge 只删旧格式且幂等、模型锚点四分支判定（21 项）
 python tests/test_check_beacon.py
 
 # 全量逐字节校验（需先拿到原始备份）

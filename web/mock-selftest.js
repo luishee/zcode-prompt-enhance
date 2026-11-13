@@ -76,10 +76,10 @@
     check('点击后调用了 /api/enhance', !!enhanceCall);
     check('请求体带上了草稿', !!enhanceCall && enhanceCall.body.text === '把这段代码改好',
       enhanceCall ? JSON.stringify(enhanceCall.body) : '');
-    // 界面锚点（data-model-current-value）优先于抓到的请求体 model：
-    // 用户切模型后界面立刻变，而请求体还停留在上一个模型。
-    check('模型优先取界面锚点（providerId/modelId 的后半段）',
-      !!enhanceCall && enhanceCall.body.model === 'DeepSeek-V4.1-Flash',
+    // 界面锚点优先于抓到的请求体 model：用户切模型后界面立刻变，而请求体还停在旧模型。
+    // data-model（遥测 span）优先级最高：它本身就是上游 model id，不需要切分。
+    check('模型优先取界面锚点（data-model）',
+      !!enhanceCall && enhanceCall.body.model === 'deepseek-flash',
       enhanceCall ? String(enhanceCall.body.model) : '');
     check('编辑器被写回增强结果', text(editor) === '【增强】把这段代码改好', text(editor));
     check('出现「还原原文」按钮', !!revertBtn() && revertBtn().hidden === false);
@@ -92,9 +92,14 @@
     check('还原后隐藏还原按钮', revertBtn().hidden === true);
 
     // ---- 5b. 界面锚点缺失时，退回抓到的真实请求体 model ----
-    // 这是 ZCode 里 data-model-current-value 因升级消失时的降级路径。
+    // 这是 ZCode 里锚点因升级消失时的降级路径。
+    const modelConfig = document.querySelector('[data-testid="v4-model-config"]');
     const modelTrigger = document.querySelector('[data-model-current-value]');
+    const savedConfigModel = modelConfig.getAttribute('data-model');
     const savedModelValue = modelTrigger.getAttribute('data-model-current-value');
+
+    // 两个界面锚点都摘掉，只剩抓到的请求体
+    modelConfig.removeAttribute('data-model');
     modelTrigger.removeAttribute('data-model-current-value');
     window.__calls.length = 0;
     setDraft('锚点缺失时也要能增强');
@@ -104,10 +109,11 @@
     check('界面锚点缺失 → 用抓到的请求体 model',
       !!fallbackCall && fallbackCall.body.model === 'primed-model',
       fallbackCall ? String(fallbackCall.body.model) : '');
+    modelConfig.setAttribute('data-model', savedConfigModel);
     modelTrigger.setAttribute('data-model-current-value', savedModelValue);
 
     // ---- 5c. 用户切模型后，界面新值必须立刻生效（不能沿用旧请求体）----
-    modelTrigger.setAttribute('data-model-current-value', 'glm/glm-5.3-flash');
+    modelConfig.setAttribute('data-model', 'glm-5.3-flash');
     window.__calls.length = 0;
     setDraft('切换模型后的增强');
     await click(button);
@@ -116,7 +122,27 @@
     check('切换模型后立刻用新模型（旧请求体作废）',
       !!switched && switched.body.model === 'glm-5.3-flash',
       switched ? String(switched.body.model) : '');
-    modelTrigger.setAttribute('data-model-current-value', savedModelValue);
+    modelConfig.setAttribute('data-model', savedConfigModel);
+
+    // ---- 5d. 锚点在 composer 的兄弟节点里也要能找到 ----
+    // 真实 ZCode 的模型选择器属于 chat toolbar，不在 [data-composer-layout] 子树内。
+    // 若注入脚本只查 composer.querySelector，这里会拿不到模型。
+    const composer = document.querySelector('[data-composer-layout]');
+    check('模型锚点确实不在 composer 子树内（模拟真实结构）',
+      !composer.querySelector('[data-model-current-value]')
+      && !composer.querySelector('[data-testid="v4-model-config"]'));
+
+    // 只留 data-model-current-value（摘掉 data-model），验证 "providerId/modelId" 的切分
+    modelConfig.removeAttribute('data-model');
+    window.__calls.length = 0;
+    setDraft('兄弟节点锚点');
+    await click(button);
+    await wait(80);
+    const sibling = window.__calls.find((c) => c.url.includes('/api/enhance'));
+    check('锚点在兄弟节点也能取到模型（向上查找 + providerId/modelId 切分）',
+      !!sibling && sibling.body.model === 'DeepSeek-V4.1-Flash',
+      sibling ? String(sibling.body.model) : '');
+    modelConfig.setAttribute('data-model', savedConfigModel);
 
     // ---- 6. 后端明确返回 success:false 时也不得清空草稿 ----
     // 这条与「网络失败」是两条不同的分支：success:false 会走到 `return` 分支，

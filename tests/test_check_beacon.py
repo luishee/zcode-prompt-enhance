@@ -149,28 +149,44 @@ def main() -> int:
         check_beacon._CACHE.clear()
         check("purge 遇到不存在的日志 → (0, 0) 且不抛异常", check_beacon.purge_legacy() == (0, 0))
 
-        # 11. 模型锚点判定：命中 / 属性缺失 / 值为空，三种结论必须互不相同。
-        # 这三条对应「按钮能挂上但换模型不跟随」——只在信标里才看得见的问题。
+        # 11. 模型锚点判定：命中 / 只命中显示名 / 锚点在但值为空 / 全无，四种结论必须互不相同。
+        # 对应「按钮能挂上但换模型不跟随」——只在信标里才看得见的问题。
         def anchor_lines(events):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 check_beacon._report_model_anchor(events)
             return buf.getvalue()
 
-        hit = anchor_lines([{"stage": "composer-seen", "hasModelValue": True, "modelFromDom": "deepseek-flash"}])
-        check("锚点命中 → 报出模型名", "✓" in hit and "deepseek-flash" in hit, hit.strip()[:80])
+        hit = anchor_lines([{"stage": "composer-seen", "modelAnchor": "config", "modelFromDom": "deepseek-flash"}])
+        check("锚点命中 data-model → 报出模型名",
+              "✓" in hit and "deepseek-flash" in hit and "v4-model-config" in hit, hit.strip()[:80])
 
-        missing = anchor_lines([{"stage": "composer-seen", "hasModelValue": False, "hasModelLabel": False}])
-        check("锚点缺失 → 报 ✗ 并指向 SEL.modelValue",
-              "✗" in missing and "SEL.modelValue" in missing, missing.strip()[:80])
-        check("锚点缺失的结论与命中不同", missing != hit)
+        via_value = anchor_lines([{"stage": "composer-seen", "modelAnchor": "value", "modelFromDom": "glm-5.3-flash"}])
+        check("锚点命中 current-value → 报出模型名",
+              "✓" in via_value and "glm-5.3-flash" in via_value, via_value.strip()[:80])
 
-        empty = anchor_lines([{"stage": "composer-seen", "hasModelValue": True, "modelFromDom": ""}])
-        check("锚点存在但值为空 → 指向取值解析",
+        only_label = anchor_lines([{"stage": "composer-seen", "modelAnchor": "label", "modelFromDom": "DeepSeek-V4.1-Flash"}])
+        check("只命中显示名 → 用 △ 提示 id 可能对不上",
+              "△" in only_label and "显示名" in only_label, only_label.strip()[:80])
+
+        missing = anchor_lines([{"stage": "composer-seen", "hasModelConfig": False,
+                                 "hasModelValue": False, "hasModelLabel": False}])
+        check("三个锚点全无 → 报 ✗ 并指向向上查找",
+              "✗" in missing and "兄弟节点" in missing, missing.strip()[:80])
+        check("全无的结论与命中不同", missing != hit)
+
+        empty = anchor_lines([{"stage": "composer-seen", "hasModelConfig": True,
+                               "hasModelValue": True, "hasModelLabel": False}])
+        check("锚点在但取不到值 → 指向取值解析",
               "✗" in empty and "取值解析" in empty, empty.strip()[:80])
 
         check("没有 composer-seen 时不输出任何结论",
               anchor_lines([{"stage": "boot"}]) == "")
+
+        # 老版本注入脚本只报 hasModelValue/hasModelLabel（没有 modelAnchor），
+        # 不能因为字段缺失就崩或误报「全无」。
+        legacy = anchor_lines([{"stage": "composer-seen", "hasModelValue": True, "modelFromDom": ""}])
+        check("老信标缺 modelAnchor 字段时不崩且给出结论", "✗" in legacy, legacy.strip()[:60])
 
     print(f"\n{TOTAL - FAILED}/{TOTAL} 通过")
     return 1 if FAILED else 0
