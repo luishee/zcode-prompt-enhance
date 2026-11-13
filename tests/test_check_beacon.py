@@ -188,6 +188,28 @@ def main() -> int:
         legacy = anchor_lines([{"stage": "composer-seen", "hasModelValue": True, "modelFromDom": ""}])
         check("老信标缺 modelAnchor 字段时不崩且给出结论", "✗" in legacy, legacy.strip()[:60])
 
+        # 12. model-pick（点击那一刻）优先于 composer-seen（首次挂载那一刻）。
+        # composer-seen 发得早，模型目录还没加载完，data-model 常是空串；
+        # 只看它会误报「锚点存在但取不到值」，而实际点击时是好的。
+        pick_wins = anchor_lines([
+            {"stage": "composer-seen", "hasModelConfig": True, "modelAnchor": "", "modelFromDom": ""},
+            {"stage": "model-pick", "anchor": "config", "model": "deepseek-flash"},
+        ])
+        check("model-pick 命中时优先采用它（不被更早的空 composer-seen 带偏）",
+              "✓" in pick_wins and "deepseek-flash" in pick_wins and "点击时" in pick_wins,
+              pick_wins.strip()[:90])
+
+        fallback = anchor_lines([
+            {"stage": "composer-seen", "hasModelConfig": True, "modelAnchor": "config",
+             "modelFromDom": "glm-5.3-flash"},
+        ])
+        check("没有 model-pick 时回退到 composer-seen",
+              "✓" in fallback and "首次挂载时" in fallback, fallback.strip()[:90])
+
+        pick_miss = anchor_lines([{"stage": "model-pick", "anchor": "", "model": ""}])
+        check("model-pick 未命中 → 报 ✗ 而不是静默",
+              "✗" in pick_miss and "点击时" in pick_miss, pick_miss.strip()[:80])
+
     print(f"\n{TOTAL - FAILED}/{TOTAL} 通过")
     return 1 if FAILED else 0
 

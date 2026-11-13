@@ -81,6 +81,14 @@
     check('模型优先取界面锚点（data-model）',
       !!enhanceCall && enhanceCall.body.model === 'deepseek-flash',
       enhanceCall ? String(enhanceCall.body.model) : '');
+    // 点击时要单独上报一次锚点命中情况：composer-seen 发得早，那时模型目录
+    // 还没加载完、data-model 常是空串，只看它会误判锚点不可用。
+    const pickBeacon = window.__calls.find(
+      (c) => c.url.includes('/api/beacon') && c.body && c.body.stage === 'model-pick',
+    );
+    check('点击时上报 model-pick（含 anchor 与 model）',
+      !!pickBeacon && pickBeacon.body.anchor === 'config' && pickBeacon.body.model === 'deepseek-flash',
+      pickBeacon ? JSON.stringify(pickBeacon.body) : '无信标');
     check('编辑器被写回增强结果', text(editor) === '【增强】把这段代码改好', text(editor));
     check('出现「还原原文」按钮', !!revertBtn() && revertBtn().hidden === false);
     check('状态区显示已增强', text(status()).includes('已增强'), text(status()));

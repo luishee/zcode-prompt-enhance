@@ -115,39 +115,52 @@ def _report_model_anchor(recent: list[dict]) -> None:
     为什么单独说：按钮能挂上、增强也能成功，但模型锚点失效时用户完全看不出来 ——
     服务端会回落到通道默认模型，结果看起来正常，只是换模型后不生效。
 
+    数据来源优先 model-pick（用户点按钮那一刻的取值），其次 composer-seen：
+    composer-seen 是在 composer 刚出现时发的，那时模型目录还没加载完，
+    data-model 往往是空串，只看它会误报「锚点存在但取不到值」。
+
     锚点在 composer 的**兄弟**节点（chat toolbar）里，不在 composer 子树内，
-    所以注入脚本是逐级向上找「最近一层含锚点的祖先」。三种失效要分开报：
-      - 三个锚点全无   → 选择器全失配，DOM 结构变了；
-      - 锚点在但值为空 → 取值解析有问题；
-      - 只命中 label   → 只能拿到显示名，模型 id 可能对不上（弹出层展开时才会命中）。
+    所以注入脚本是逐级向上找「最近一层含锚点的祖先」。四种失效分开报：
+      - 三锚点全无     → 选择器全失配，DOM 结构变了；
+      - 锚点在但值为空 → 取值解析或加载时机有问题；
+      - 只命中 label   → 只能拿到显示名，模型 id 可能对不上。
     """
-    seen = [ev for ev in recent if ev.get("stage") == "composer-seen"]
-    if not seen:
-        return
-    last = seen[-1]
-    model = last.get("modelFromDom")
-    anchor = last.get("modelAnchor")
-    has_config = last.get("hasModelConfig")
-    has_value = last.get("hasModelValue")
-    has_label = last.get("hasModelLabel")
+    picks = [ev for ev in recent if ev.get("stage") == "model-pick"]
+    if picks:
+        last = picks[-1]
+        anchor = last.get("anchor")
+        model = last.get("model")
+        source = "点击时"
+    else:
+        seen = [ev for ev in recent if ev.get("stage") == "composer-seen"]
+        if not seen:
+            return
+        last = seen[-1]
+        anchor = last.get("modelAnchor")
+        model = last.get("modelFromDom")
+        source = "首次挂载时"
 
     if anchor and model:
         via = {"config": "data-testid=v4-model-config", "value": "data-model-current-value",
                "label": "data-composer-open-label（显示名）"}.get(anchor, anchor)
         if anchor == "label":
-            print(f"△ 模型锚点只命中显示名：{model}（来源 {via}）")
+            print(f"△ 模型锚点只命中显示名：{model}（{source}，来源 {via}）")
             print("  显示名可能被截断或与上游 id 不一致；能命中 data-model 时优先用它。")
         else:
-            print(f"✓ 模型锚点命中：{model}（来源 {via}）")
+            print(f"✓ 模型锚点命中：{model}（{source}，来源 {via}）")
         return
 
+    has_config = last.get("hasModelConfig")
+    has_value = last.get("hasModelValue")
+    has_label = last.get("hasModelLabel")
+
     if has_config or has_value or has_label:
-        print("✗ 模型锚点存在但取不到值：增强会回落到通道默认模型。")
+        print(f"✗ 模型锚点存在但取不到值（{source}）：增强会回落到通道默认模型。")
         print(f"  锚点存在情况：v4-model-config={has_config} current-value={has_value} open-label={has_label}")
         print("  → 检查取值解析（data-model 直接用；data-model-current-value 应按第一个 / 切分）")
         return
 
-    print("✗ 三个模型锚点都没找到：增强会回落到通道默认模型，")
+    print(f"✗ 三个模型锚点都没找到（{source}）：增强会回落到通道默认模型，")
     print("  表现为「在界面里换模型后增强不跟随」。")
     print("  → 锚点通常在 chat toolbar（composer 的兄弟节点），确认 modelScope 的向上查找范围")
 

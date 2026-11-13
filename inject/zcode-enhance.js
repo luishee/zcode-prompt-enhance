@@ -546,6 +546,11 @@
     };
 
     try {
+      // 用「点击这一刻」的模型值，并把命中情况上报：
+      // composer-seen 是在 composer 刚出现时发的，那时模型目录还没加载完，
+      // data-model 往往是空串 —— 只按那条信标判断锚点是否可用会误判。
+      const picked = readModelAnchor(st.composer);
+      beacon('model-pick', { anchor: picked.anchor, model: picked.model });
       const resp = await fetch(`${ENDPOINT}/api/enhance`, {
         method: 'POST',
         headers: apiHeaders(),
