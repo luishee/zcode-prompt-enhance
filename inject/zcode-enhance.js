@@ -36,9 +36,13 @@
     empty: '请先输入需要增强的提示词',
     cancelled: '已取消本次提示词增强',
     failedWith: (e) => `提示词增强失败：${e}`,
-    offline: '增强服务未响应：确认插件「增强提示词服务」已启用，且 127.0.0.1:8770 在监听',
+    // 端口被别的进程占着时，服务会在后台退避重试（最长约 13 分钟），
+    // 所以这里要提示「稍后重试」，否则用户会以为插件根本没装。
+    offline: '增强服务未响应：确认插件「增强提示词服务」已启用，且 127.0.0.1:8770 在监听；'
+      + '若刚重启过 ZCode，旧进程可能还占着端口，等一会儿再试',
     done: (model) => (model ? `已增强 · ${model}` : '已增强'),
-    overLength: (max) => `结果超过 ${max || 800} 字，可再点一次让模型收敛`,
+    // 实测「再点一次」只会越改越长（34→298→707 字），不能承诺收敛。
+    overLength: (max) => `结果超过 ${max || 800} 字，建议手动精简后再用`,
     writeBackFailed: '已生成增强结果，但写回输入框失败（编辑器结构可能已变）',
   };
 
@@ -46,6 +50,9 @@
     composer: '[data-composer-layout]',
     actions: '[data-composer-leading-actions]',
     editor: '[data-lexical-editor="true"]',
+    // 模型选择器 trigger 上的属性，收起/展开都在（值是 "providerId/modelId"）。
+    // 这是唯一可靠的界面锚点：下面 modelLabel 那个属性只在弹出层展开时才渲染。
+    modelValue: '[data-model-current-value]',
     modelLabel: '[data-composer-open-label]',
     ownButton: '[data-zce-enhance]',
     ownRevert: '[data-zce-revert]',
@@ -103,7 +110,16 @@
   }
 
   // ---------------------------------------------------------------- 模型探测
-  // ZCode 发请求时会把真实 model id 放进 body，抓它最准；DOM 标签只是显示名，作次选。
+  //
+  // 三条来源，按可靠度排序：
+  //   1. [data-model-current-value]：模型选择器 trigger 上的属性，值是 "providerId/modelId"，
+  //      收起态也存在 —— 这是实测唯一稳定的界面锚点。
+  //   2. fetch 钩子抓到的真实请求体（最准，但只在 ZCode 自己发请求时才有）。
+  //   3. [data-composer-open-label]：只在弹出层展开时渲染，只能算彩蛋，不能当主路径。
+  //
+  // 早先只用了 2 和 3，结果两条都不命中：ZCode 的模型请求走主进程（out/host），
+  // 渲染层的 window.fetch 根本看不到；而 3 的属性在收起态不存在（beacon 里
+  // 43/43 次 composer-seen 都是 hasModelLabel:false）。于是"跟随当前模型"实际没生效。
   let lastRequestModel = '';
   let lastRequestAt = 0;
   let lastModelLabel = '';
@@ -131,29 +147,53 @@
     };
   })();
 
-  // 抓到的 model 有保鲜期，且用户切换模型后要立刻让位给界面标签：
+  // 抓到的 model 有保鲜期，且用户切换模型后要立刻让位给界面锚点：
   // 否则「切了模型但还没发过消息」时，第一次增强会用上一个模型。
   const MODEL_CAPTURE_TTL_MS = 10 * 60_000;
 
-  function currentModel() {
-    let label = '';
+  /**
+   * 读界面上的模型值。
+   * `data-model-current-value` 是 "providerId/modelId" 形式（providerId 里本身不带 "/"），
+   * 所以按第一个 "/" 切分取后半段就是上游认识的 model id；没有 "/" 时整串就是 model id。
+   */
+  function readModelFromDom(composer) {
+    const scope = composer || document;
+    let value = '';
     try {
-      // 用 textContent：标签可能被 truncate 或按布局隐藏，innerText 会拿到空串
-      label = (document.querySelector(SEL.modelLabel)?.textContent || '').trim();
+      const el = scope.querySelector(SEL.modelValue);
+      value = (el?.getAttribute('data-model-current-value') || '').trim();
     } catch {
       /* ignore */
     }
-    // 可能是 "DeepSeek-V4.1-Flash · 经济模式" 这类复合文案，取首段
-    label = label.split(/[·|｜]/)[0].trim();
-
-    if (label && label !== lastModelLabel) {
-      // 只有「从一个标签变成另一个」才算用户切换了模型；
-      // 第一次读到标签（lastModelLabel 还是空）不能把刚抓到的 id 作废。
-      if (lastModelLabel) lastRequestModel = '';
-      lastModelLabel = label;
+    if (value && value !== '<synthetic>') {
+      const slash = value.indexOf('/');
+      const modelId = slash > 0 ? value.slice(slash + 1).trim() : value;
+      if (modelId) return modelId;
     }
+    // 兜底：弹出层展开时的显示名（可能被截断，只能算次选）
+    try {
+      const label = (scope.querySelector(SEL.modelLabel)?.textContent || '').trim();
+      // 可能是 "DeepSeek-V4.1-Flash · 经济模式" 这类复合文案，取首段
+      if (label) return label.split(/[·|｜]/)[0].trim();
+    } catch {
+      /* ignore */
+    }
+    return '';
+  }
+
+  function currentModel(composer) {
+    const fromDom = readModelFromDom(composer);
+
+    // 界面值变了 = 用户切了模型，立刻作废抓到的请求体 model（它属于上一个模型）
+    if (fromDom && fromDom !== lastModelLabel) {
+      if (lastModelLabel) lastRequestModel = '';
+      lastModelLabel = fromDom;
+    }
+
     const fresh = lastRequestModel && Date.now() - lastRequestAt < MODEL_CAPTURE_TTL_MS;
-    return (fresh ? lastRequestModel : '') || label || '';
+    // 优先级：界面值 > 新鲜的真实请求体。
+    // 反过来的话，用户切模型后第一次增强会沿用旧模型（界面已经变了，请求体还是旧的）。
+    return fromDom || (fresh ? lastRequestModel : '');
   }
 
   // ---------------------------------------------------------------- 编辑器读写
@@ -484,7 +524,7 @@
       const resp = await fetch(`${ENDPOINT}/api/enhance`, {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify({ text: draft, model: currentModel() || undefined }),
+        body: JSON.stringify({ text: draft, model: currentModel(st.composer) || undefined }),
         signal: controller.signal,
       });
       const data = await readJsonResponse(resp);
@@ -690,7 +730,11 @@
       beacon('composer-seen', {
         hasActions: !!composer.querySelector(SEL.actions),
         hasEditor: !!findEditor(composer),
+        // 两个模型锚点分开报：modelValue 是主路径（收起态也在），
+        // modelLabel 只在弹出层展开时才有，只能算彩蛋。混在一起会看不出哪个失效。
+        hasModelValue: !!composer.querySelector(SEL.modelValue),
         hasModelLabel: !!composer.querySelector(SEL.modelLabel),
+        modelFromDom: readModelFromDom(composer),
         composerAttrs: Array.from(composer.attributes).map((a) => a.name).join(','),
       });
     }

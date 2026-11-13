@@ -52,7 +52,9 @@
         <div data-composer-leading-actions>
           <div data-composer-leading-content>
             <button type="button" class="chip">＋</button>
-            <span class="chip" data-composer-open-label>DeepSeek-V4.1-Flash</span>
+            <!-- 模型选择器 trigger：data-model-current-value 是 "providerId/modelId"，
+                 收起态也存在（ZCode 里 data-composer-open-label 只在弹出层展开时才渲染）。 -->
+            <button type="button" class="chip" data-model-current-value="deepseek-GO/DeepSeek-V4.1-Flash">DeepSeek-V4.1-Flash</button>
           </div>
         </div>
         <div data-composer-trailing-actions><button type="submit">发送</button></div>

@@ -13,10 +13,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
 from pathlib import Path
+from contextlib import redirect_stdout
 
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent / "tools"
@@ -146,6 +148,29 @@ def main() -> int:
         check_beacon.LOG_PATH = Path(td) / "missing.log"
         check_beacon._CACHE.clear()
         check("purge 遇到不存在的日志 → (0, 0) 且不抛异常", check_beacon.purge_legacy() == (0, 0))
+
+        # 11. 模型锚点判定：命中 / 属性缺失 / 值为空，三种结论必须互不相同。
+        # 这三条对应「按钮能挂上但换模型不跟随」——只在信标里才看得见的问题。
+        def anchor_lines(events):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                check_beacon._report_model_anchor(events)
+            return buf.getvalue()
+
+        hit = anchor_lines([{"stage": "composer-seen", "hasModelValue": True, "modelFromDom": "deepseek-flash"}])
+        check("锚点命中 → 报出模型名", "✓" in hit and "deepseek-flash" in hit, hit.strip()[:80])
+
+        missing = anchor_lines([{"stage": "composer-seen", "hasModelValue": False, "hasModelLabel": False}])
+        check("锚点缺失 → 报 ✗ 并指向 SEL.modelValue",
+              "✗" in missing and "SEL.modelValue" in missing, missing.strip()[:80])
+        check("锚点缺失的结论与命中不同", missing != hit)
+
+        empty = anchor_lines([{"stage": "composer-seen", "hasModelValue": True, "modelFromDom": ""}])
+        check("锚点存在但值为空 → 指向取值解析",
+              "✗" in empty and "取值解析" in empty, empty.strip()[:80])
+
+        check("没有 composer-seen 时不输出任何结论",
+              anchor_lines([{"stage": "boot"}]) == "")
 
     print(f"\n{TOTAL - FAILED}/{TOTAL} 通过")
     return 1 if FAILED else 0

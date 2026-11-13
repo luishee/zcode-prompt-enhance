@@ -109,6 +109,32 @@ def purge_legacy() -> tuple[int, int]:
     return removed, len(kept)
 
 
+def _report_model_anchor(recent: list[dict]) -> None:
+    """报告「跟随当前模型」用的界面锚点是否命中。
+
+    为什么单独说：按钮能挂上、增强也能成功，但模型锚点失效时用户完全看不出来 ——
+    服务端会回落到通道默认模型，结果看起来正常，只是换模型后不生效。
+    早先主锚点用的是只在弹出层展开时才渲染的 data-composer-open-label，
+    于是 beacon 里 43/43 次都是 hasModelLabel:false，问题一直没被发现。
+    """
+    seen = [ev for ev in recent if ev.get("stage") == "composer-seen"]
+    if not seen:
+        return
+    last = seen[-1]
+    has_value = last.get("hasModelValue")
+    model = last.get("modelFromDom")
+    if has_value and model:
+        print(f"✓ 模型锚点命中：{model}（增强会用 ZCode 当前选择的模型）")
+        return
+    if has_value and not model:
+        print("✗ data-model-current-value 存在但值为空：增强会回落到通道默认模型。")
+        print("  → 检查 SEL.modelValue 的取值解析（providerId/modelId 应按第一个 / 切分）")
+        return
+    print("✗ 没找到 data-model-current-value：增强会回落到通道默认模型，")
+    print("  表现为「在界面里换模型后增强不跟随」。")
+    print("  → 需要按当前 DOM 更新 SEL.modelValue 选择器")
+
+
 def main() -> int:
     force_utf8()
     parser = argparse.ArgumentParser()
@@ -197,6 +223,7 @@ def main() -> int:
         print("✓ 脚本已加载，按钮已挂到输入框工具栏上。")
         if "composer-seen" not in stages:
             print("  （缺 composer-seen，可能只是没记录到首次接手）")
+        _report_model_anchor(recent)
         return 0
     if "attach-failed" in stages:
         print("✗ 找到了 composer，但锚点失配，按钮没挂上。")
