@@ -48,6 +48,7 @@ cd zcode-prompt-enhance
 - [开发与测试](#开发与测试)
 - [技术实现笔记](#技术实现笔记)
 - [已知限制](#已知限制)
+- [协议](#协议)
 
 ---
 
@@ -906,6 +907,30 @@ node C:\Users\<你>\.zcode\cli\plugins\cache\dev-zcode-prompt-enhance\enhance-se
 
 ---
 
+## 协议
+
+本项目（注入脚本、ZCode 插件、工具脚本与文档）以 **MIT** 协议开源，全文见 [LICENSE](LICENSE)。
+
+```
+MIT License · Copyright (c) 2026 luishee
+```
+
+简单说：
+
+- **可以**自由使用、修改、合并、发布、再授权、商用，无需事先告知。
+- **需要**在副本或重要部分中保留上面的版权声明与许可声明（`LICENSE` 文件一起带走即可）。
+- **无担保**：软件按"现状"提供，作者不对使用后果负责。这条对「修改 ZCode 安装包」尤其要留意——
+  本工具只做最小改动并自带校验/回滚，但改第三方安装包的风险仍由使用者自行承担。
+
+另外两点说明：
+
+- ZCode 是第三方产品，其许可与商标与本项目无关；本项目只是在本机给它的渲染层加一个按钮，
+  不包含也不分发 ZCode 的任何代码或资源。
+- 注入脚本会改动你本机的 `app.asar`。分发本项目的修改版时，请同样保留 `LICENSE`
+  并自行承担该版本的行为责任。
+
+---
+
 ## English
 
 **ZCode Prompt Enhance** adds a `✨ Enhance prompt` button under the composer of the ZCode desktop app.
@@ -920,3 +945,9 @@ an MCP server that also serves `127.0.0.1:8770`) started and stopped with ZCode.
 Windows only. Python 3.10+ and Node 18+ required, no third-party packages.
 See the sections above for install steps, usage, and the `.bat` maintenance entry
 (`修复增强提示词按钮.bat`, also callable as `修复增强提示词按钮.bat apply|status|check|restore`).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 luishee.
+ZCode itself is a third-party product; this project ships none of its code and only patches
+the local `app.asar` on your machine. Patching a third-party installation is done at your own risk.
