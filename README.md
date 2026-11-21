@@ -63,7 +63,13 @@ cd zcode-prompt-enhance
 | 失败不动草稿 | 网络异常、`success:false` 两条分支都**不覆盖**输入框，只在状态区提示原因 |
 | 双通道回退 | 先走 ZCode 当前 provider（通道 A），失败自动切自配端点（通道 B），响应里说明实际通道 |
 | 结果清洗 | 剥代码围栏、剥首尾引号、「增强后的提示词：」前缀；删除 ≤80 字的语言元信息行 |
-| 超长提醒 | 增强结果超过 800 字给出提示（可再点一次让模型收敛），不静默截断 |
+| 结果校验 | 模型输出先过一遍代码校验（索要材料 / 前置步骤 / 占位符 / 凭空加技术栈 / 改代码块 / 丢禁则），不过则带修正指令重试一次 |
+| 增强档位 | `auto`（默认，按草稿长度自动选）/ `professional`（展开改写）/ `basic`（只做清晰化） |
+| 长度分档 | 上限按草稿长度与档位动态算（短草稿 professional 为 1200 字，basic 为 200），超出只给黄条提示，不截断 |
+| 未增强如实告知 | 服务端判定「草稿已够清晰」时返回 `improved:false`，界面显示「草稿已足够清晰，未做改动」并附判定原因 |
+| 请求期间保护 | 增强途中用户继续输入时，放弃写回并提示，绝不覆盖新内容 |
+| 取消 | 增强中按钮保持可点（用 `aria-busy` 而非 `disabled`），再点一次或按 `Esc` 取消 |
+| 超长提醒 | 增强结果超过当前档位上限给出提示，不静默截断 |
 | UI 自愈 | ZCode 是 React + Lexical，工具栏被重渲染替换后自动补回按钮 |
 | 诊断信标 | 按钮不显示时可定位到「脚本没加载 / 找不到输入框 / 锚点失配 / 写回失败」 |
 | MCP 工具 | 插件同时暴露 `enhance_prompt`、`enhance_service_status`，可在 ZCode 对话里直接调用 |
@@ -75,9 +81,12 @@ cd zcode-prompt-enhance
 2. **还原可反复切换** —— 还原后清空快照，可再次增强；
 3. **服务端兜底清理元信息** —— 模型偶尔会输出「用户输入是中文 → 应回复中文」这类行，按「整行 ≤80 字」判定删除，不误伤长正文；
 4. **双通道自动回退** —— ZCode 通道失败自动切到自配端点；
-5. **超长提示** —— 超 800 字给出提示；
+5. **长度分档提示** —— 上限按草稿长度与档位算，超出给黄条提示；
 6. **编辑器重渲染自愈** —— 工具栏被替换后自动补回按钮；
-7. **诊断信标** —— 按钮不出现时能从日志定位到具体卡在哪一步。
+7. **诊断信标** —— 按钮不出现时能从日志定位到具体卡在哪一步；
+8. **结果校验与重试** —— 拦「索要材料 / 凭空加技术栈 / 改代码块」等不合格输出；
+9. **未增强如实告知** —— 判定不必改时显示「未做改动」并说明原因，不谎报「已增强」；
+10. **请求期间保护** —— 用户中途继续输入时不覆盖新内容。
 
 ---
 
@@ -89,11 +98,13 @@ cd zcode-prompt-enhance
 
 | 状态文案 | 含义 |
 | --- | --- |
-| `增强中…` | 请求进行中，按钮变为旋转图标，再点一次可取消 |
+| `增强中…` | 请求进行中，按钮变为旋转图标（`aria-busy`，保持可点），再点一次或按 `Esc` 取消 |
 | `已增强 · <模型>` | 成功并已写回编辑器 |
 | `已增强 · <模型> · 通道 fallback` | 实际走的是通道 B（ZCode 通道不可用） |
 | `已增强 · <模型> · 清理 N 行元信息` | 模型输出了语言标签行，服务端已删除 |
-| `结果超过 800 字，可再点一次让模型收敛` | 黄色警告，不截断内容 |
+| `结果超过 <N> 字，建议手动精简后再用` | 黄色警告，不截断内容；N 由档位与草稿长度决定 |
+| `草稿已足够清晰，未做改动（<原因>）` | 服务端判定不必改（`improved:false`），草稿原样保留 |
+| `增强期间草稿已被修改，本次结果未写入` | 请求途中用户继续输入，放弃写回以保护新内容 |
 | `请先输入需要增强的提示词` | 空草稿，未发起请求 |
 | `已取消本次提示词增强` | 用户主动取消 |
 | `已还原原文` | 还原成功 |
@@ -202,7 +213,7 @@ ZCode 渲染层（file:// 加载 index.html）
 两份提示词（`enhance_system.txt` + `enhance_user.txt`）会**同时**生效，所以它们不能互相打架：
 早期 system 里写了「不要建议用户没提到的技术」，但它自己的 few-shot 例子却在指定 Next.js 和页面结构，
 实测于是「写个爬虫」会变成「请用 **Python** 编写…」、「写个登录页面」会变成「如原生 HTML/CSS/JavaScript 或 **React**」。
-现在两份都收敛到同一条口径：**不替用户选技术栈、不补用户没要的功能、保持紧凑（远低于 800 字）**。
+现在两份都收敛到同一条口径：**不替用户选技术栈、不补用户没要的功能、保持紧凑**（长度上限由 `lengthBand` 按草稿与档位动态计算）。
 
 ---
 
@@ -352,8 +363,19 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | --- | --- | --- |
 | `/api/health` | GET | 服务与通道状态（含 `tokenRequired`） |
 | `/api/models` | GET | 模型列表（`source: upstream` 表示真的从上游取到了） |
-| `/api/enhance` | POST | `{text, model?}` → `{success, text, model, channel, elapsedMs, removedMetaLines, maxLength, overLength}`；草稿超 8000 字返回 `code: input_too_long`；`text` 不是字符串返回 `code: invalid_input`；上游 `finish_reason=length` 返回 `code: truncated`（不写回半截结果）；请求体超 256KB 返回 **413** |
+| `/api/enhance` | POST | `{text, model?, mode?, noCache?}` → `{success, text, model, mode, channel, elapsedMs, removedMetaLines, maxLength, overLength, improved, cached, deduped, attempts}`；草稿超 8000 字返回 `code: input_too_long`；`text` 不是字符串返回 `code: invalid_input`；上游 `finish_reason=length` 返回 `code: truncated`（不写回半截结果）；请求体超 256KB 返回 **413** |
 | `/api/beacon` | POST | 注入脚本上报诊断信标（写 `%LOCALAPPDATA%\zcode-prompt-enhance\beacon.log`，单行 JSON、5MB 轮转） |
+
+**关于 `improved`**：`improved:false` 表示服务端判定「草稿已够清晰，改不如不改」，
+此时 `text` 就是原文、`success` 仍为 `true`。调用方必须看这个字段，
+否则会把「没改动」显示成「已增强」。判定原因在 `attempts[].error` 里。
+
+**关于 `mode`**：`auto`（默认）/ `professional` / `basic`。留空即 `auto`，按草稿长度自动选。
+`basic` 只做清晰化、上限 200 字；`professional` 展开改写、短草稿上限 1200 字。
+
+**关于 `noCache`**：服务端默认只开「并发去重」（同一草稿 + 同档位 + 同模型正在请求时，
+第二个请求等第一个的结果，避免重复花钱）。结果缓存默认关闭；
+`noCache:true` 同时关掉两层，强制一次独立的上游调用。
 
 > **谁能调这些接口**：只接受本机来源。不带 `Origin` 的命令行调用（上面的 PowerShell 示例）直接可用；
 > `file://` / 应用自定义协议（`Origin: null`）必须带 `X-ZCE-Token` —— 令牌由 `apply` 生成在
@@ -363,7 +385,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 > 请求体上限 256KB（信标 64KB），超出返回 413。
 > 收紧的原因：`Access-Control-Allow-Origin: *` 时代，浏览器里任意网页都能用你的 key 调 `/api/enhance`。
 
-上游调用参数：`temperature: 0.3`（改写任务要稳）、`max_tokens: 1200`、超时 60 秒。
+上游调用参数：`temperature: 0.2`（改写任务要稳）、`max_tokens: 4000`（推理模型的思考也吃这个额度）、超时 60 秒。
 
 ### 通道 B：自配端点（可选）
 
@@ -502,12 +524,13 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `python tools/verify_patch.py` | 全量逐字节校验（实测约 3.18 万文件）。参数默认取 `patch-state.json` 记录的基线与当前包，无需手输 |
 | `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步（只读插件格式、只统计本次启动） |
 | `python tools/check_beacon.py --purge-legacy` | 物理删除日志里 Python 时代的旧格式行（只留插件格式），再照常分析 |
-| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 36 项 DOM 断言 |
+| `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 39 项 DOM 断言 |
 | `node tests/test_mcp_server.mjs` | 插件服务测试（80 项，含生命周期、端口冲突、令牌热更新、截断/类型校验） |
+| `node tests/test_validate.mjs` | 结果校验器与长度分档测试（48 项：asks_user 三段式、tech_added、档位选择、提示词契约） |
 | `python tests/test_patch_zcode.py` | asar 写入层测试（46 项：apply/幂等/刷新/还原/无基线保护） |
 | `python tests/test_entry_bat.py` | 入口 `.bat` 契约测试（35 项：编码/换行约定、退出码、参数透传与演练文案，不碰 ZCode） |
 | `python tests/test_plugin_manifest.py` | 插件清单契约测试（13 项：`plugin.json`/`.mcp.json`/变量名/脚本与 prompts 是否真的存在） |
-| `python tests/test_check_beacon.py` | 信标解析测试（21 项：只读插件格式、忽略旧格式、BOM/损坏行/缓存失效、purge 幂等、模型锚点四分支判定） |
+| `python tests/test_check_beacon.py` | 信标解析测试（28 项：只读插件格式、忽略旧格式、BOM/损坏行/缓存失效、purge 幂等、模型锚点四分支判定、服务端 kind 记录汇总） |
 | `python tools/menu.py [apply\|status\|check\|restore]` | `.bat` 的实际实现，也可直接调（`-h` 看用法） |
 
 `--asar` / `--backup` / `--endpoint` 三个选项可以透传给 `.bat`（写在动作之后，选项在子命令之前）：
@@ -732,10 +755,11 @@ zcode-prompt-enhance/
 │   └─ menu.py                     维护菜单（.bat 的实际内容）
 ├─ tests/
 │   ├─ test_mcp_server.mjs         插件服务测试（80 项，含生命周期、令牌热更新与截断校验）
+│   ├─ test_validate.mjs           结果校验器测试（48 项，含 asks_user/tech_added/档位）
 │   ├─ test_patch_zcode.py         asar 写入层测试（46 项，用合成小包）
 │   ├─ test_entry_bat.py           入口 .bat 契约测试（编码/换行、退出码、参数转发）
 │   ├─ test_plugin_manifest.py     插件清单契约测试（变量名/脚本/prompts 是否可用）
-│   └─ test_check_beacon.py        信标解析测试（只读插件格式、忽略旧格式）
+│   └─ test_check_beacon.py        信标解析测试（28 项，含服务端 kind 记录汇总）
 ├─ web/                            本地预览页 + DOM 自测用页面
 ├─ 修复增强提示词按钮.bat          维护入口（双击运行：注入/状态/检查/还原）
 ├─ .env.example                    通道 B 环境变量参考（不会被自动加载）
@@ -750,8 +774,13 @@ zcode-prompt-enhance/
 # 插件服务测试：MCP 握手、tools/call、HTTP、端口冲突、令牌热更新、截断/类型校验、stdin 关闭即退出（80 项）
 node tests/test_mcp_server.mjs
 
+# 结果校验器测试：asks_user 三段式判定（条件句+索要动作才违规、抵消项放行）、
+# tech_added（草稿点名语言时降为警告）、长度分档、档位选择、提示词契约（48 项，不联网）
+node tests/test_validate.mjs
+
 # 注入脚本 DOM 自测：按钮位置、type=button、空输入、写回、还原、失败保草稿、
-# 官方 API 优先、写回全失败的信标、模型锚点优先级与兄弟节点查找（36 项，需要 Chrome/Edge）
+# 官方 API 优先、写回全失败的信标、模型锚点优先级与兄弟节点查找、
+# 请求中取消（真实点击语义）、中途编辑不覆盖、improved:false 提示与原因（39 项，需要 Chrome/Edge）
 python tools/run_dom_test.py
 
 # asar 写入层测试：在临时目录里合成小包，跑 apply / 幂等 / 刷新 / --out / restore /
@@ -768,7 +797,7 @@ python tests/test_entry_bat.py
 python tests/test_plugin_manifest.py
 
 # 信标解析测试：只读插件格式（纯 JSON）、忽略 Python 时代旧格式、BOM/损坏行/缓存失效、
-# purge 只删旧格式且幂等、模型锚点四分支判定（21 项）
+# purge 只删旧格式且幂等、模型锚点四分支判定、服务端 kind 记录汇总（28 项）
 python tests/test_check_beacon.py
 
 # 全量逐字节校验（默认用 patch-state.json 里的基线与当前包；也可显式指定）
@@ -948,6 +977,26 @@ an MCP server that also serves `127.0.0.1:8770`) started and stopped with ZCode.
 Windows only. Python 3.10+ and Node 18+ required, no third-party packages.
 See the sections above for install steps, usage, and the `.bat` maintenance entry
 (`修复增强提示词按钮.bat`, also callable as `修复增强提示词按钮.bat apply|status|check|restore`).
+
+## 版本记录
+
+### 0.1.9
+
+- **结果校验器**：模型输出先过代码校验（索要材料 / 前置步骤 / 占位符 / 凭空加技术栈 /
+  改代码块 / 丢禁则），不合格则带修正指令重试一次，仍不过就退回原文并如实标记 `improved:false`。
+- **增强档位**：`auto` / `professional` / `basic`，长度上限按草稿长度与档位动态计算。
+- **`asks_user` 三段式判定**：条件句单独出现不再算违规；「列出假设 / 自行决定」这类
+  抵消项出现即放行。修正了「如果缺少…先列出你的假设」这类正确输出被误判的问题。
+- **`tech_added` 收窄**：新增基础语言识别（Python / C++ / Go 等）。草稿已点名技术时，
+  补充同栈库降为警告而非硬失败；草稿完全没点名时仍硬拦。
+- **并发去重**：同一草稿 + 同档位 + 同模型正在请求时，第二个请求等第一个的结果。
+- **端口低频重试**：密集重试（约 13 分钟）用尽后转 60~180s 低频重试，不再永久放弃。
+- **`shutdown` 幂等**：`rl close` 与 `stdin end` 双触发时只记一次退出日志。
+
+### 0.1.6
+
+- 模型锚点改用 `data-model-current-value`（收起态也在），并补 `data-model` 主路径。
+- 插件清单契约测试（`.mcp.json` / `plugin.json`）。
 
 ## License
 
