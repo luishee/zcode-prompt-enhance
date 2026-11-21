@@ -1240,6 +1240,8 @@ async function handleMessage(message) {
 // ------------------------------------------------------------------ 启动
 
 const httpState = { listening: false, server: null, port: null, retrying: false, giveUp: null, slowRetry: false };
+// shutdown 可能被多个信号同时触发（rl close / stdin end / SIGTERM / SIGINT），只认第一次
+let shuttingDown = false;
 
 /**
  * 实际监听端口。
@@ -1305,6 +1307,10 @@ async function startHttp() {
 }
 
 function shutdown(reason) {
+  // 幂等：stdin 关闭时 rl 'close' 与 stdin 'end' 会先后各触发一次，
+  // 早先会打两条「退出（…）」日志，看日志时容易误判成退了两次。
+  if (shuttingDown) return;
+  shuttingDown = true;
   log(`退出（${reason}）`);
   try {
     httpState.server?.close();
