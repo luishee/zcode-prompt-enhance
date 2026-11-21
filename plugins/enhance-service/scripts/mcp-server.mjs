@@ -23,7 +23,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, createHash } from 'node:crypto';
 
 const SERVER_NAME = 'enhance-service';
 
@@ -53,7 +53,52 @@ const ZCODE_PROVIDER_CONFIG = process.env.PROMPT_ENHANCER_ZCODE_CONFIG
 
 // 注入脚本会把草稿原样发过来；10 万字的草稿既超出模型上下文，也白烧钱
 const MAX_INPUT_CHARS = 8_000;
-const MAX_OUT_LEN = 800;
+
+/**
+ * 增强档位。
+ *
+ * professional：短草稿展开成完整指令（WorkBuddy 口径，实测 4 字 → 480~860 字）。
+ * basic：草稿本身已经装了用户的要求，只做清晰化，不再扩写。
+ * auto：< 60 字走 professional，否则 basic。这个分界来自实测——长草稿被展开会翻三倍
+ * （2026-11-21：211 字草稿 → 969 字结果，用户要滚屏删），而短草稿不展开就几乎没有价值。
+ */
+function resolveMode(mode, draftLen) {
+  const want = String(mode ?? '').trim().toLowerCase();
+  if (want === 'professional' || want === 'basic') return want;
+  return draftLen < 60 ? 'professional' : 'basic';
+}
+
+function promptFilesFor(mode) {
+  return mode === 'basic'
+    ? { system: 'enhance_system_basic.txt', user: 'enhance_user_basic.txt' }
+    : { system: 'enhance_system.txt', user: 'enhance_user.txt' };
+}
+
+/**
+ * 结果长度带（按档位）。
+ *
+ * 四次踩坑（2026-11-21 实测）：
+ *   ① 原来写死 800 字，长草稿被硬割；
+ *   ② 改成「1.5x~3x」，模型几无遵从——4 字草稿回 590 字；
+ *   ③ 把目标字数写进重试指令也没用，仍回 361~967 字；
+ *   ④ 短草稿 professional 上限定 600，实测 5/5 超长（624~1133 字），黄条变成常态噪音。
+ * 根因是当前唯一的可用模型（deepseek-flash）是推理模型，且「压缩这段文字」会把它
+ * 拖进思考死循环（max_tokens 8000 都被 reasoning 吃干、content 恒为空）。所以带宽
+ * 按实测能力定：上限取实测分布的上沿，宁可宽一点也不让黄条常态出现。
+ * 长度只做警告（前端黄条），不做硬失败——硬失败会把可用结果整份杀掉。
+ * min 取 0.9 倍，允许轻微压缩；否则少一个标点就判「丢了内容」。
+ */
+function lengthBand(draftLen, mode = 'professional') {
+  const basic = mode === 'basic';
+  const min = draftLen <= 60 ? Math.ceil(draftLen * 1.1) : Math.ceil(draftLen * 0.9);
+  // professional 的短草稿上限 1200：实测 5/5 落在 624~1133 字，且重试后可能到 1400+。
+  // basic 保持 200——它本来就只做清晰化，超了是真异常。
+  if (draftLen <= 60) return { min, max: basic ? 200 : 1200 };
+  if (draftLen <= 250) {
+    return { min, max: Math.ceil(draftLen * (basic ? 1.5 : 2.5)) + (basic ? 50 : 200) };
+  }
+  return { min, max: Math.ceil(draftLen * (basic ? 1.2 : 1.5)) + (basic ? 30 : 200) };
+}
 // 单次 HTTP 请求体上限：按钮只会发一段草稿，留足余量即可
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -76,6 +121,147 @@ const META_LINE_PATTERNS = [
 ];
 const LEADING_LABEL_RE =
   /^\s*(?:增强(?:后)?的?提示词|改写后的提示词|优化后的提示词|enhanced prompt|revised prompt|improved prompt)\s*[:：]\s*/i;
+
+// ------------------------------------------------------------------ 结果校验
+// 为什么提示词之外必须还有这套（2026-11-21 实测）：deepseek-flash 对「至多一处填补」、
+// 「只补属于本任务的细节」这类元规则遵从不稳定。改了三轮提示词之后仍出现
+// 「总结这份周报（具体是哪份周报由你自行确定）」这种凭空加料，以及
+// "inspect the surrounding code" 这种越界前置步骤。措辞管不住的，只能由代码拦：
+// 拦下就带修正指令重试一次，仍不过就退回原文，绝不把不合格结果当增强成功写回输入框。
+
+// 向用户索要材料。注意「请说明」不在此列——那是让助手解释，属合法增强。
+//
+// 必须拆成两段（2026-11-21 修正）：早先把「如果…缺少」当成独立违规词，结果把
+// 「如果缺少关键信息，先列出你的假设再给方案，不要连续追问」这类**正确**输出判成
+// 违规。实测带代码问报错的 3 次里就有一句是这种写法，本该放行却退回原文。
+// 所以条件句只在「同时出现索要动作」时才算违规；而「列假设继续做」这类短语
+// 下面是明确的抵消项，出现即不算。
+const ASK_ACTION_RE = /请(?:先)?(?:提供|附上|补充|告知|反馈|发我|给我)|(?:向|和|与|跟|问)(?:我|你|您)(?:确认|提问|澄清|要)|请(?:你|您)?确认|由(?:我|你)确认|please (?:provide|share|attach)|ask me|let me know|clarify with me|tell me (?:if|what|which)/i;
+// 条件句：单独出现不代表违规，要看伴随的是「索要」还是「继续做」
+const ASK_CONDITION_RE = /(?:如(?:果)?|若|万一|假如)[^\n。；;]{0,24}(?:不足|缺少|缺失|不明|不清|没有提供|未提供|为空)/i;
+// 抵消项：出现这些说明模型是让助手自己往下走，而不是把球踢回用户
+const ASK_SUPPRESS_RE = /列出(?:你的|所做)?假设|说明(?:你的)?假设|按(?:最小|最合理|默认)[^\n。；;]{0,8}(?:方案|理解|处理)|不要(?:连续)?追问|无需追问|自行(?:决定|判断|选择)|由你(?:决定|判断)|use your (?:judgement|judgment)|state your assumptions|make reasonable assumptions/i;
+
+/**
+ * 判断一段输出是否在向用户索要材料。
+ *
+ * 三步：先看有没有「条件句 + 索要动作」同现（最紧的那种真违规），
+ * 再看有没有裸的索要动作但被「列假设继续做」抵消，最后兜住无条件的直接索要。
+ * 顺序不能颠倒：抵消项的作用域是一句话，不是整段。
+ */
+function asksUserForMaterial(out) {
+  for (const sentence of String(out ?? '').split(/(?<=[。！？!?\n])/)) {
+    if (!AskSentenceHasAsk(sentence)) continue;
+    if (ASK_SUPPRESS_RE.test(sentence)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** 单句判定：有索要动作就算；只有条件句、没有动作的不算。 */
+function AskSentenceHasAsk(sentence) {
+  if (!sentence?.trim()) return false;
+  // 「如果缺少 X，请提供 Y」= 条件句 + 动作，是典型违规
+  if (ASK_CONDITION_RE.test(sentence) && ASK_ACTION_RE.test(sentence)) return true;
+  // 裸的条件句（没有索要动作）不算：模型只是提醒自己该怎么处理
+  if (ASK_CONDITION_RE.test(sentence)) return false;
+  // 没有条件句时，任何索要动作都算
+  return ASK_ACTION_RE.test(sentence);
+}
+// 需要额外动作的前置步骤（用户草稿里没有这类要求，增强不该把它加出来）
+const PREP_RE = /(?:locate|reproduce|grep|inspect the|search the (?:codebase|repo|code)|look (?:through|into)|check the (?:repository|codebase))/i;
+const TECH_RE = /\b(?:Next\.js|NextJS|React|Vue|Django|Flask|FastAPI|PostgreSQL|MySQL|Redis|MongoDB|pandas|numpy|Spring|Laravel|TensorFlow|PyTorch)\b/gi;
+// 基础语言必须一起认。TECH_RE 只列框架/库，早先草稿里写「Python」时 techIn 是空集，
+// 于是输出里的 numpy/pandas 全被判成「凭空加技术栈」——实测「如何优化 Python 循环性能」
+// 两轮都不过、整份退回原文，用户看到的是「点了没反应」。
+// 注意：这里误报是安全的（只会让判定更宽松），漏报才是 bug。
+const LANG_RE = /\b(?:JavaScript|TypeScript|Python|Golang|Java|Rust|Ruby|Kotlin|Swift|Scala|Perl|Lua|MATLAB|SQL|Bash|PowerShell)\b|C\+\+|C#/gi;
+const CODE_BLOCK_RE = /```[\s\S]*?```/g;
+// 占位符：实测模型会把「（在此粘贴原文）」「{{在此粘贴需要改写的文本}}」这类填空标记
+// 写进结果，用户贴回输入框还得自己填，等于没增强。
+// 只认带「粘贴 / insert / your text」字样的标记——用户的模板变量（{{location_theme}}）
+// 是合法内容，必须逐字保留，不能一并拦掉。
+const PLACEHOLDER_RE = /（在此粘贴[^）]*）|\{\{[^}]*(?:粘贴|insert|your text|your prompt)[^}]*\}\}|\{[^{}]*(?:在此粘贴|待粘贴)[^{}]*\}|\[(?:insert|paste)[^\]]*\]|<(?:your|insert)[^>]*>/i;
+// 用户自己写的禁则。只认「不要 / 别 / 禁止 / 无需 / do not / never」这一类；
+// 不认「只给 / only」——后者的语义落在那一个限定词上，抽成关键词必然误判
+// （"只给代码"抽成"代码"，于是任何含"代码"的输出都算保留，等于没检查）。
+const PROHIBITION_RE = /(?:不要|无需|不用|禁止|别)[^\s，。；、！!？?\n]{1,24}|(?:do not|don't|dont|never)\s+[A-Za-z][A-Za-z0-9 _/-]{0,28}/gi;
+
+/** 全局正则复用时必须重置 lastIndex，否则第二次调用会从上次匹配处继续。 */
+function collectMatches(re, text) {
+  re.lastIndex = 0;
+  return [...text.matchAll(re)].map((m) => m[0]);
+}
+
+/**
+ * 从禁则短语里抽出核心词，用来判断模型有没有把这条禁则丢掉。
+ *
+ * 为什么不按整句比：用户写「不要解释」，模型写「不要任何解释」是等价保留，
+ * 按整句比会把合格结果判成违规，而误杀的代价是整次增强退回原文——
+ * 用户看到的是「点了按钮没反应」，比漏检一条禁则严重得多。宁可漏检。
+ */
+function prohibitionCores(draft) {
+  const cores = new Set();
+  for (const raw of collectMatches(PROHIBITION_RE, draft)) {
+    const core = raw
+      .replace(/^(?:不要|无需|不用|禁止|别)\s*/, '')
+      .replace(/^(?:do not|don't|dont|never)\s+/i, '')
+      .trim()
+      .toLowerCase();
+    // 单字核心词（「改」「用」）没有辨识度，收进来会让判定退化成恒真
+    if (core.length >= 2) cores.add(core);
+  }
+  return [...cores];
+}
+
+/**
+ * 校验增强结果，返回 { ok, reasons, warnings }。
+ *
+ * 判定顺序按「越硬的先查」：先查会不会害用户（索要材料、留下占位符），再查会不会
+ * 偷换任务（前置步骤、替用户选技术），最后查保真（代码块、禁则）。
+ *
+ * 长度不进 ok：一条偏长但内容合格的提示词，用户拿到手就能用，只是需要自己删两句；
+ * 而整份退回原文，用户得到的是「点了按钮没反应」。前端的黄条通道（overLength）
+ * 本来就是为这件事准备的，所以长度走 warnings。
+ */
+function validateEnhancement(draft, out, mode = 'professional') {
+  const reasons = [];
+  const warnings = [];
+  if (!out) return { ok: false, reasons: ['empty'], warnings };
+
+  if (asksUserForMaterial(out)) reasons.push('asks_user');
+  if (PREP_RE.test(out)) reasons.push('preparatory_step');
+  if (PLACEHOLDER_RE.test(out)) reasons.push('placeholder_left');
+
+  // 「替用户选技术栈」只在**草稿完全没点名技术**时才是硬失败：
+  // 那时模型加什么都是替用户做主（「写个爬虫」→「用 React 写」）。
+  // 草稿已经点名了语言/框架时，补一个同栈的库属于合理展开，不该整份退回原文——
+  // 实测「如何优化 Python 循环性能」就因为这个把可用结果丢了两轮。
+  // 这类情况降为 warning：结果照常返回，痕迹留在信标里便于回看。
+  const techIn = new Set([...collectMatches(TECH_RE, draft), ...collectMatches(LANG_RE, draft)]
+    .map((s) => s.toLowerCase()));
+  const techOut = new Set([...collectMatches(TECH_RE, out), ...collectMatches(LANG_RE, out)]
+    .map((s) => s.toLowerCase()));
+  const addedTech = [...techOut].filter((t) => !techIn.has(t));
+  if (addedTech.length) {
+    if (techIn.size === 0) reasons.push(`tech_added:${addedTech.join(',')}`);
+    else warnings.push(`tech_added:${addedTech.join(',')}`);
+  }
+
+  // 代码块必须整块原样保留：拆散、改空格、改缩进都会破坏可复制性
+  const blocks = collectMatches(CODE_BLOCK_RE, draft);
+  if (blocks.some((b) => !out.includes(b))) reasons.push('code_block_changed');
+
+  const outLower = out.toLowerCase();
+  const lost = prohibitionCores(draft).filter((core) => !outLower.includes(core));
+  if (lost.length) reasons.push(`prohibition_lost:${lost.length}`);
+
+  const band = lengthBand(draft.length, mode);
+  if (out.length > band.max) warnings.push(`over_length:${out.length}>${band.max}`);
+  if (out.length < band.min) warnings.push(`under_length:${out.length}<${band.min}`);
+
+  return { ok: reasons.length === 0, reasons, warnings };
+}
 
 const log = (...args) => process.stderr.write(`[enhance-service] ${args.join(' ')}\n`);
 
@@ -143,13 +329,20 @@ function rotateBeaconLog() {
 }
 
 function appendBeacon(raw) {
-  const text = String(raw).slice(0, 2000);
   let payload;
-  try {
-    const parsed = JSON.parse(text);
-    payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { raw: text };
-  } catch {
-    payload = { raw: text };
+  // 调用方有两种：HTTP 客户端发来的一段 JSON 文本，以及服务内部直接传对象。
+  // 早先只处理字符串，内部传对象会被落成 {"raw":"[object Object]"} ——
+  // 排查时等于没写（2026-11-21 实测踩到，校验失败的原因全丢了）。
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    payload = { ...raw };
+  } else {
+    const text = String(raw).slice(0, 2000);
+    try {
+      const parsed = JSON.parse(text);
+      payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { raw: text };
+    } catch {
+      payload = { raw: text };
+    }
   }
   // 落盘一律单行 JSON：客户端塞进来的换行会被转义，
   // 否则任何人都能伪造一整行信标，把 check_beacon 的结论带偏。
@@ -216,35 +409,42 @@ class UpstreamError extends Error {
 /**
  * 通道 A：读 ZCode 自己的 provider 配置，等价于「用它当前在用的模型」。
  *
- * 取第一条**真正可用**的规则，而不是 rules[0]：多 provider 配置下第一条可能已被
- * 停用、或根本没填 baseUrl，那样会白白丢掉一个可用通道并回退到通道 B。
+ * 返回**所有**可用 provider，而不是第一条。早先只取第一条 enabled 且填了 baseUrl 的
+ * 规则——单 provider 时没错，但多 provider 下用户当前选中的模型可能属于第二个，
+ * 那样会拿第一个的 baseUrl/apiKey 去调，要么 404 要么用错 key。
+ * 排序按 ZCode 自己的 providerOrder，未列在里面的排最后。
  */
-function readZcodeChannel() {
+function readZcodeChannels() {
   const cfg = readJson(ZCODE_PROVIDER_CONFIG);
-  if (!cfg) return null;
+  if (!cfg) return [];
   const container = cfg.config ?? {};
   const rules = container.providerConfigRules?.providerRules ?? [];
+  const order = Array.isArray(container.providerOrder) ? container.providerOrder : [];
+  const rank = (id) => {
+    const i = order.indexOf(id);
+    return i < 0 ? order.length : i;
+  };
 
-  for (const rule of rules) {
-    if (!rule || rule.enabled === false) continue;
-    const baseUrl = String(rule.config?.api?.baseUrl ?? '').replace(/\/+$/, '');
-    if (!baseUrl) continue;
-
-    const models = [];
-    for (const mr of container.modelConfigRules?.providerModelRules ?? []) {
-      if (mr.providerId !== rule.providerId) continue;
-      if (mr.config?.enabled === false) continue;
-      if (mr.modelId) models.push(mr.modelId);
-    }
-    return {
-      name: 'zcode',
-      label: `ZCode 当前配置（${rule.providerName || rule.providerId}）`,
-      baseUrl,
-      apiKey: String(rule.config?.access?.apiKey ?? '').trim(),
-      models,
-    };
-  }
-  return null;
+  return rules
+    .filter((rule) => rule && rule.enabled !== false)
+    .filter((rule) => String(rule.config?.api?.baseUrl ?? '').trim())
+    .sort((a, b) => rank(a.providerId) - rank(b.providerId))
+    .map((rule) => {
+      const models = [];
+      for (const mr of container.modelConfigRules?.providerModelRules ?? []) {
+        if (mr.providerId !== rule.providerId) continue;
+        if (mr.config?.enabled === false) continue;
+        if (mr.modelId) models.push(mr.modelId);
+      }
+      return {
+        name: 'zcode',
+        providerId: String(rule.providerId ?? ''),
+        label: `ZCode 配置（${rule.providerName || rule.providerId}）`,
+        baseUrl: String(rule.config?.api?.baseUrl ?? '').replace(/\/+$/, ''),
+        apiKey: String(rule.config?.access?.apiKey ?? '').trim(),
+        models,
+      };
+    });
 }
 
 /** 通道 B：环境变量优先，其次插件目录下的 config.json / config.local.json。 */
@@ -275,10 +475,28 @@ function readFallbackChannel() {
 
 function buildChannels() {
   const prefer = (process.env.PROMPT_ENHANCER_PREFER || 'zcode').toLowerCase();
-  const zcode = readZcodeChannel();
+  const zcode = readZcodeChannels();
   const fallback = readFallbackChannel();
-  const ordered = prefer === 'fallback' ? [fallback, zcode] : [zcode, fallback];
-  return ordered.filter(Boolean);
+  const fallbackList = fallback ? [fallback] : [];
+  return prefer === 'fallback' ? [...fallbackList, ...zcode] : [...zcode, ...fallbackList];
+}
+
+/**
+ * 当前端点名了模型时，把它所在的 provider 提到最前。
+ *
+ * 只看模型 id 不看 providerId 是有意的：注入脚本从 `data-model-current-value`
+ * 拿到的是 "providerId/modelId"，但它只转发了 modelId（改注入脚本要动 asar，现在
+ * 没有回滚基线）。所以这里用「哪个 provider 声明了这个模型」反推，稳定排序，
+ * 命中不到的保持原顺序——不猜、不乱序。
+ */
+function orderChannelsForModel(channels, requested) {
+  const want = String(requested ?? '').trim().toLowerCase();
+  if (!want) return channels;
+  const hit = (ch) => ch.models.some((m) => String(m).toLowerCase() === want);
+  return channels
+    .map((ch, index) => ({ ch, index, score: hit(ch) ? 0 : 1 }))
+    .sort((a, b) => a.score - b.score || a.index - b.index)
+    .map((x) => x.ch);
 }
 
 // ------------------------------------------------------------------ 上游调用
@@ -360,38 +578,82 @@ function resolveModel(ch, requested, available) {
   // 没点名时：先看通道配置里的默认模型，再看上游 /models 的返回（早先只用前者，
   // 于是「通道 B 配了端点但没配 model」会误报「该通道没有可用模型」，尽管列表取到了）。
   if (!want) return ch.models[0] ?? available[0]?.id ?? '';
-  for (const m of available) if (m.id === want) return m.id;
   const low = want.toLowerCase();
+  // 配置里的写法才是权威 id：先按大小写不敏感匹配一次，把大小写归一。
+  // 某些上游对 model 大小写敏感，原样透传会莫名报「模型不存在」。
+  const inConfig = ch.models.find((m) => String(m).toLowerCase() === low);
+  if (inConfig) return inConfig;
+  for (const m of available) if (m.id === want) return m.id;
   for (const m of available) {
     if ((m.name || '').toLowerCase() === low || m.id.toLowerCase() === low) return m.id;
   }
   return want; // 匹配不上就原样传，让上游报错，别猜
 }
 
+/**
+ * 校验未过之后，把具体违规项翻译成重试指令。
+ *
+ * 为什么不直接再调一次：模型不知道自己哪里违规，重试只会重复同样的毛病。
+ * 为什么不再写「太长了，压到 N 字」：实测该指令无效（重试仍回 361~967 字），
+ * 而且「压缩这段文字」会让推理模型陷进思考死循环——长度已改走黄条提示，不在这里拦。
+ */
+function retryRules(reasons) {
+  const lines = [
+    'FINAL ATTEMPT: your previous reply was rejected. Fix exactly the problems below,',
+    'and return only the corrected prompt.',
+  ];
+  if (reasons.includes('asks_user')) {
+    lines.push('- Do not ask the user for material or confirmation: no 请提供 / 请附上 / 向我确认 / please provide / ask me / let me know.');
+  }
+  if (reasons.includes('placeholder_left')) {
+    lines.push('- Do not leave placeholders such as "（在此粘贴原文）": write the prompt for the content the user described.');
+  }
+  if (reasons.some((r) => r.startsWith('tech_added'))) {
+    lines.push('- Remove every technology, library and framework the draft did not name.');
+  }
+  if (reasons.includes('preparatory_step')) {
+    lines.push('- Remove preparatory steps such as locate / inspect / reproduce.');
+  }
+  if (reasons.includes('code_block_changed')) {
+    lines.push('- Copy the code block exactly as it appears in the draft.');
+  }
+  if (reasons.some((r) => r.startsWith('prohibition_lost'))) {
+    lines.push('- Keep the constraints the user wrote (不要… / do not …) in the result.');
+  }
+  return lines.join('\n');
+}
+
 function loadPrompt(name) {
   return readFileSync(join(PROMPT_DIR, name), 'utf8');
 }
 
-async function callEnhance(ch, model, text) {
-  const systemPrompt = loadPrompt('enhance_system.txt');
-  const template = loadPrompt('enhance_user.txt');
+async function callEnhance(ch, model, text, mode, extraRules = '') {
+  const files = promptFilesFor(mode);
+  const systemPrompt = loadPrompt(files.system);
+  const template = loadPrompt(files.user);
   if (!template.includes('{input}')) {
-    throw new UpstreamError('enhance_user.txt 缺少 {input} 占位符');
+    throw new UpstreamError(`${files.user} 缺少 {input} 占位符`);
   }
-  // 必须用 split/join 而不是 replace(pattern, text)：
-  // 后者会把草稿里的 $&、$`、$' 当成替换模式，把用户内容改得面目全非。
-  const userPrompt = template.split('{input}').join(text);
+  // 草稿以 JSON 字符串的形式嵌进模板：引号、换行、代码块、反斜杠都由 JSON.stringify
+  // 负责转义，草稿里出现 "originalPrompt" 或模板里的标签名也破不了结构。
+  // 早先直接做裸文本替换，草稿含闭合标签时会把「素材边界」搞乱。
+  const userPrompt = template.split('{input}').join(JSON.stringify(text));
   const data = await requestJson(`${ch.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(ch) },
     body: {
       model,
       messages: [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: systemPrompt + (extraRules ? `\n\n${extraRules}` : '') },
         { role: 'user', content: userPrompt },
       ],
-      temperature: 0.3, // 改写任务要稳：温度高了会自由发挥、偏离原意
-      max_tokens: 1200,
+      // 改写任务要稳：实测 0.3 时同一输入在不同提示词版本下输出长度差异明显，
+      // 降到 0.2 让结果更可复现。
+      temperature: 0.2,
+      // deepseek-flash 是推理模型，max_tokens 同时覆盖思考与正文：实测首轮
+      // reasoning 吃 617、正文 319，而「压缩文本」类请求能把 2000 全吃进思考、
+      // 正文返回空（finish_reason=length）。4000 给足余量，减少空响应。
+      max_tokens: 4000,
     },
   });
   const choice = data?.choices?.[0];
@@ -406,7 +668,7 @@ async function callEnhance(ch, model, text) {
 
 // ------------------------------------------------------------------ 核心逻辑
 
-async function enhance(text, requestedModel = '') {
+async function enhanceInner(text, requestedModel = '', requestedMode = '') {
   // 类型必须严格校验：`String(text ?? '')` 会把 {"a":1} 变成 "[object Object]" 发给模型，
   // 既花了用户的 token，又返回一段「内容缺失」的废话，前端还当成功写回输入框。
   if (text !== undefined && text !== null && typeof text !== 'string') {
@@ -430,24 +692,36 @@ async function enhance(text, requestedModel = '') {
     };
   }
 
-  const channels = buildChannels();
+  // 端点点名了模型就把它所在的 provider 提到最前；没点名时保持配置顺序。
+  const channels = orderChannelsForModel(buildChannels(), requestedModel);
   if (!channels.length) {
     return { success: false, text: '', code: 'upstream_unavailable', error: '没有可用通道（读不到 ZCode provider 配置，也没有 config.json）' };
   }
 
+  const requested = String(requestedModel ?? '').trim();
+
+  // 档位在通道循环之前定好：重试必须沿用同一档，
+  // 否则第一次用展开档、第二次用保守档，等于换了个任务。
+  const mode = resolveMode(requestedMode, input.length);
+
   const attempts = [];
   for (const ch of channels) {
     // 前端已经点名了通道自带的模型 id 时，没必要再打一次 /models
-    const known = requestedModel && ch.models.includes(requestedModel);
+    const known = requested && ch.models.some((m) => String(m).toLowerCase() === requested.toLowerCase());
     const available = known ? [] : await listModels(ch);
-    const model = resolveModel(ch, requestedModel, available);
+    const model = resolveModel(ch, requested, available);
     if (!model) {
       attempts.push({ channel: ch.name, code: 'llm_error', error: '该通道没有可用模型' });
       continue;
     }
+    // 「用的是哪个模型」必须可分辨：requested 有值说明前端把当前选中的模型传过来了；
+    // 空值则是兜底（配置里的第一个），二者在排查时是完全不同的结论。
+    const modelSource = !requested
+      ? (ch.models.length ? 'provider-first' : 'upstream-first')
+      : (String(model).toLowerCase() === requested.toLowerCase() ? 'requested' : 'requested-unverified');
     const started = Date.now();
     try {
-      const raw = await callEnhance(ch, model, input);
+      const raw = await callEnhance(ch, model, input, mode);
       const { text: cleaned, removedMetaLines } = cleanResult(raw.content);
       if (!cleaned) {
         attempts.push({ channel: ch.name, code: 'llm_error', error: '模型返回空结果' });
@@ -456,20 +730,71 @@ async function enhance(text, requestedModel = '') {
       // 被 max_tokens 截断的结果是半截提示词（可能停在半个列表项或半个句子上）。
       // 与其把它写回输入框让用户以为增强成功，不如如实报错并保留草稿。
       if (raw.finishReason === 'length') {
-        attempts.push({ channel: ch.name, code: 'truncated', error: '模型输出被 max_tokens 截断' });
+        attempts.push({
+          channel: ch.name,
+          code: 'truncated',
+          error: `模型输出被 max_tokens 截断（已输出 ${raw.content.length} 字）`,
+        });
         continue;
       }
+
+      // 提示词管不住的违规，交给代码拦。不过就带修正指令重试一次，
+      // 仍不过就换下一个通道，所有通道都不过由外层退回原文（见 enhance 末尾）。
+      let verdict = validateEnhancement(input, cleaned, mode);
+      if (!verdict.ok) {
+        attempts.push({ channel: ch.name, code: 'validation', error: `校验未过：${verdict.reasons.join(', ')}` });
+        const retryRaw = await callEnhance(
+          ch, model, input, mode,
+          `${retryRules(verdict.reasons)}\nViolations: ${verdict.reasons.join('; ')}`,
+        );
+        const retryCleaned = cleanResult(retryRaw.content).text;
+        if (retryRaw.finishReason === 'length' || !retryCleaned) {
+          attempts.push({ channel: ch.name, code: 'validation', error: '重试结果为空或被截断' });
+          continue;
+        }
+        const retryVerdict = validateEnhancement(input, retryCleaned, mode);
+        if (!retryVerdict.ok) {
+          attempts.push({ channel: ch.name, code: 'validation', error: `重试仍未过：${retryVerdict.reasons.join(', ')}` });
+          continue;
+        }
+        const retryBand = lengthBand(input.length, mode);
+        return {
+          success: true,
+          text: retryCleaned,
+          original: input,
+          model,
+          modelSource,
+          channel: ch.name,
+          providerId: ch.providerId ?? '',
+          channelLabel: ch.label,
+          elapsedMs: Date.now() - started,
+          removedMetaLines: 0,
+          improved: true,
+          retried: true,
+          mode,
+          maxLength: retryBand.max,
+          // 偏长不算失败：交给前端黄条提示「结果超过 N 字，建议手动精简后再用」
+          overLength: retryVerdict.warnings.some((w) => w.startsWith('over_length')),
+        };
+      }
+
+      const band = lengthBand(input.length, mode);
       return {
         success: true,
         text: cleaned,
         original: input,
         model,
+        modelSource,
         channel: ch.name,
+        providerId: ch.providerId ?? '',
         channelLabel: ch.label,
         elapsedMs: Date.now() - started,
         removedMetaLines,
-        maxLength: MAX_OUT_LEN,
-        overLength: cleaned.length > MAX_OUT_LEN,
+        improved: true,
+        retried: false,
+        mode,
+        maxLength: band.max,
+        overLength: verdict.warnings.some((w) => w.startsWith('over_length')),
       };
     } catch (err) {
       attempts.push({
@@ -481,7 +806,157 @@ async function enhance(text, requestedModel = '') {
   }
 
   const last = attempts[attempts.length - 1] ?? { code: 'unknown', error: '没有可用通道' };
+
+  // 区分两类失败：上游不可用（模型没跑通，结果为空）与「结果不合格」（模型跑通了，
+  // 但违反了红线）。后者不是故障——草稿本身已经很清晰时，「不改动」就是正确答案，
+  // 报 error 会让前端弹红条、用户以为功能坏了。所以这里退回原文，并如实标记
+  // improved: false，让调用方（MCP 工具）知道「没增强成功，但服务是好的」。
+  //
+  // 这里必须主动说明一个限制：注入脚本只认 success / text / overLength 三个字段，
+  // 无法把「未增强」显示出来，用户看到的是输入框内容没变。要让它可见就得改注入脚本
+  // （即改 asar，而当前没有回滚基线），所以这里先不动，只把事实留在信标里。
+  const allValidation = attempts.length > 0 && attempts.every((a) => a.code === 'validation');
+  if (allValidation) {
+    appendBeacon({
+      kind: 'enhance-fallback',
+      inputLen: input.length,
+      reasons: attempts.map((a) => a.error),
+    });
+    return {
+      success: true,
+      text: input,
+      original: input,
+      model: '',
+      modelSource: 'none',
+      channel: '',
+      providerId: '',
+      channelLabel: '',
+      elapsedMs: 0,
+      improved: false,
+      mode,
+      attempts,
+      maxLength: lengthBand(input.length, mode).max,
+      overLength: false,
+    };
+  }
   return { success: false, text: '', code: last.code, error: last.error, attempts };
+}
+
+/**
+ * 最近一次调用的模型去向。
+ *
+ * 为什么要在内存里留一份：「增强用的是哪个模型」是这个功能最常被质疑的一点，
+ * 而 provider 配置、前端 DOM、上游模型列表三者可能各不相同。把最后一次的结论
+ * 记下来，/api/health 直接能看，不用再去翻信标或加日志。
+ */
+const lastRun = { at: null, model: '', modelSource: '', mode: '', improved: null, channel: '', cached: false, deduped: false };
+
+/**
+ * 重复调用的两层处理，默认只开第一层。
+ *
+ * **第一层：并发去重（默认开）**
+ * 同一份草稿 + 同档位 + 同模型正在请求时，第二个请求直接等第一个的结果。
+ * 实测意义（2026-11-21）：一次增强 4~12 秒、重试时 44 秒，而按钮 tooltip 写着
+ * 「再次点击可取消当前这次增强」——用户取消后立刻重点，服务端那次其实还在跑，
+ * 不去重就是两次完整调用、两份钱。去重后第二次直接拿到正在进行的那一份。
+ *
+ * **第二层：结果缓存（默认关）**
+ * 加它之前先确认了连点到底会不会发生：注入脚本在请求中会 `button.disabled = loading`，
+ * 所以手滑连点这条路不存在。既然如此，结果缓存的唯一效果就是「用户对结果不满意、
+ * 原样再点一次时，永远拿到同一份」——那是伤害，不是优化。
+ * 所以默认 TTL=0（关闭），要开必须显式设 PROMPT_ENHANCER_RESULT_CACHE_TTL（秒）。
+ * 将来若前端能显示「（缓存）」或提供「重新生成」按钮，再打开它才成立。
+ */
+const RESULT_CACHE_TTL_MS = Math.max(0, Number(process.env.PROMPT_ENHANCER_RESULT_CACHE_TTL ?? 0) || 0) * 1000;
+const RESULT_CACHE_MAX = 100;
+const resultCache = new Map(); // key -> { at, result }
+const inFlight = new Map(); // key -> Promise<result>
+
+function cacheKeyOf(text, model, mode) {
+  // 用 sha1 而不是原文当键：8000 字的草稿直接做键会让 Map 常驻几十 MB
+  return createHash('sha1')
+    .update(`${mode}\u0000${String(model ?? '').toLowerCase()}\u0000${text}`, 'utf8')
+    .digest('hex');
+}
+
+function cacheGet(key) {
+  if (RESULT_CACHE_TTL_MS <= 0) return null;
+  const hit = resultCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > RESULT_CACHE_TTL_MS) {
+    resultCache.delete(key);
+    return null;
+  }
+  // LRU：命中的条目挪到末尾，淘汰时总是从最久未用的开始
+  resultCache.delete(key);
+  resultCache.set(key, hit);
+  return hit.result;
+}
+
+function cacheSet(key, result) {
+  if (RESULT_CACHE_TTL_MS <= 0) return;
+  resultCache.set(key, { at: Date.now(), result });
+  // Map 保持插入顺序，第一个键就是最久未用的
+  while (resultCache.size > RESULT_CACHE_MAX) {
+    resultCache.delete(resultCache.keys().next().value);
+  }
+}
+
+/** 测试用：清空两层，避免用例之间互相命中。 */
+function clearResultCache() {
+  resultCache.clear();
+  inFlight.clear();
+}
+
+/** 把一次调用的结论记进 lastRun，供 /api/health 直接读取。 */
+function recordRun(result, flags = {}) {
+  lastRun.at = new Date().toISOString();
+  lastRun.model = result.model ?? '';
+  lastRun.modelSource = result.modelSource ?? '';
+  lastRun.mode = result.mode ?? '';
+  lastRun.improved = result.improved ?? null;
+  lastRun.channel = result.providerId || result.channel || '';
+  lastRun.cached = flags.cached === true;
+  lastRun.deduped = flags.deduped === true;
+}
+
+async function enhance(text, requestedModel = '', requestedMode = '', noCache = false) {
+  const original = String(text ?? '').trim();
+  // noCache 同时关掉两层：连「等别人那一份」也不要，就是强制一次独立的上游调用
+  const reuse = !noCache && original !== '';
+  // 键里的 mode 必须和 enhanceInner 内部算出来的一致，所以这里用同一套规则先算一遍
+  const key = reuse ? cacheKeyOf(original, requestedModel, resolveMode(requestedMode, original.length)) : '';
+
+  if (reuse) {
+    // 第一层：同一请求正在飞行中 → 等它，不再打第二次上游
+    const running = inFlight.get(key);
+    if (running) {
+      const shared = await running;
+      recordRun(shared, { deduped: true });
+      return { ...shared, cached: false, deduped: true };
+    }
+    // 第二层：结果缓存（默认关闭，见常量区的说明）
+    const hit = cacheGet(key);
+    if (hit) {
+      recordRun(hit, { cached: true });
+      return { ...hit, cached: true, deduped: false };
+    }
+  }
+
+  const pending = enhanceInner(text, requestedModel, requestedMode);
+  if (reuse) inFlight.set(key, pending);
+  let result;
+  try {
+    result = await pending;
+  } finally {
+    // 成功失败都要摘掉：留着一条已失败的 Promise，会让后续同草稿请求一直拿到同一个失败
+    if (reuse) inFlight.delete(key);
+  }
+
+  recordRun(result);
+  // 只收「真增强成功」：退回原文和失败都要给下次留重试机会
+  if (reuse && result.success === true && result.improved === true) cacheSet(key, result);
+  return { ...result, cached: false, deduped: false };
 }
 
 // ------------------------------------------------------------------ HTTP（供注入的按钮调用）
@@ -610,8 +1085,21 @@ function createHttpServer() {
           tokenRequired: !!token,
           tokenFile: TOKEN_FILE,
           channels: channels.map((c) => ({
-            name: c.name, label: c.label, baseUrl: c.baseUrl, hasKey: !!c.apiKey, models: c.models.slice(0, 8),
+            name: c.name,
+            providerId: c.providerId ?? '',
+            label: c.label,
+            baseUrl: c.baseUrl,
+            hasKey: !!c.apiKey,
+            models: c.models.slice(0, 8),
           })),
+          modes: ['auto', 'professional', 'basic'],
+          cache: {
+            dedupeEnabled: true,
+            resultCacheTtlMs: RESULT_CACHE_TTL_MS,
+            size: resultCache.size,
+            inFlight: inFlight.size,
+          },
+          lastRun,
         }, cors);
         return;
       }
@@ -653,7 +1141,7 @@ function createHttpServer() {
           sendJson(res, 400, { success: false, text: '', code: 'unknown', error: `请求体不是合法 JSON：${err.message}` }, cors);
           return;
         }
-        sendJson(res, 200, await enhance(body.text, body.model), cors);
+        sendJson(res, 200, await enhance(body.text, body.model, body.mode, body.noCache === true), cors);
         return;
       }
       sendJson(res, 404, { error: 'not found' }, cors);
@@ -676,6 +1164,16 @@ const TOOLS = [
       properties: {
         text: { type: 'string', description: '要增强的草稿原文' },
         model: { type: 'string', description: '可选，指定模型；留空则用 ZCode 当前配置的模型' },
+        mode: {
+          type: 'string',
+          enum: ['auto', 'professional', 'basic'],
+          description: '增强档位：professional 展开成完整指令，basic 只做清晰化不扩写；'
+            + 'auto（默认）按草稿长度选（<60 字走 professional）',
+        },
+        noCache: {
+          type: 'boolean',
+          description: '跳过结果缓存，强制重新调用模型（默认 false；同一草稿 10 分钟内会命中缓存）',
+        },
       },
       required: ['text'],
       additionalProperties: false,
@@ -690,7 +1188,7 @@ const TOOLS = [
 
 async function callTool(name, args) {
   if (name === 'enhance_prompt') {
-    const result = await enhance(args?.text ?? '', args?.model ?? '');
+    const result = await enhance(args?.text ?? '', args?.model ?? '', args?.mode ?? '', args?.noCache === true);
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   }
   if (name === 'enhance_service_status') {
@@ -741,7 +1239,7 @@ async function handleMessage(message) {
 
 // ------------------------------------------------------------------ 启动
 
-const httpState = { listening: false, server: null, port: null, retrying: false, giveUp: null };
+const httpState = { listening: false, server: null, port: null, retrying: false, giveUp: null, slowRetry: false };
 
 /**
  * 实际监听端口。
@@ -758,7 +1256,14 @@ function servedPort() {
 const PORT_RETRY_FAST = 15;
 const PORT_RETRY_FAST_MS = 2_000;
 const PORT_RETRY_SLOW_MS = 30_000;
-const PORT_RETRY_MAX_TRIES = 40; // 15×2s + 25×30s ≈ 13 分钟，足够覆盖重启/升级
+const PORT_RETRY_MAX_TRIES = 40; // 前 15×2s + 25×30s ≈ 13 分钟按密集节奏重试
+// 13 分钟之后不放弃，改成每 1~3 分钟试一次。
+// 为什么改（2026-11-21 实测）：残留的第二个实例抢不到端口，按原来的逻辑在 13 分钟时
+// 永久放弃；随后真正的监听者退出，端口就空悬了——进程还活着、按钮却点不动，
+// 而且日志里再没有任何相关记录。低频重试不会新增进程（进程本来就因为 stdin 开着不退），
+// 只是给它一个在端口空出来后接管的机会。间隔加随机抖动，避免多个残留实例同一刻一起撞。
+const PORT_RETRY_IDLE_MS = 60_000;
+const PORT_RETRY_IDLE_JITTER_MS = 120_000;
 
 async function startHttp() {
   const attempt = (n) =>
@@ -767,18 +1272,17 @@ async function startHttp() {
       httpState.server = server;
       server.once('error', (err) => {
         if (err.code === 'EADDRINUSE') {
-          if (n + 1 >= PORT_RETRY_MAX_TRIES) {
-            httpState.listening = false;
-            httpState.giveUp = 'EADDRINUSE';
-            log(`端口 ${PORT} 连续 ${PORT_RETRY_MAX_TRIES} 次被占用，停止重试。`
-              + ' 按钮会显示「服务未响应」；关掉占用该端口的进程后重启 ZCode 即可恢复。');
-            resolve();
-            return;
-          }
-          const delay = n < PORT_RETRY_FAST ? PORT_RETRY_FAST_MS : PORT_RETRY_SLOW_MS;
           httpState.listening = false;
           httpState.retrying = true;
-          log(`端口 ${PORT} 被占用，${delay / 1000}s 后重试（第 ${n + 2} 次）`);
+          const idle = n + 1 >= PORT_RETRY_MAX_TRIES;
+          httpState.slowRetry = idle;
+          const delay = idle
+            ? PORT_RETRY_IDLE_MS + Math.floor(Math.random() * PORT_RETRY_IDLE_JITTER_MS)
+            : (n < PORT_RETRY_FAST ? PORT_RETRY_FAST_MS : PORT_RETRY_SLOW_MS);
+          // 密集阶段每次都记；低频阶段每 10 次记一次，免得刷爆日志
+          if (!idle || (n + 1 - PORT_RETRY_MAX_TRIES) % 10 === 0) {
+            log(`端口 ${PORT} 被占用，${Math.round(delay / 1000)}s 后重试（第 ${n + 2} 次${idle ? '，低频模式' : ''}）`);
+          }
           const timer = setTimeout(() => resolve(attempt(n + 1)), delay);
           timer.unref?.(); // 等待重试不该阻止进程退出
           return;
@@ -791,6 +1295,7 @@ async function startHttp() {
         httpState.listening = true;
         httpState.retrying = false;
         httpState.giveUp = null;
+        httpState.slowRetry = false;
         httpState.port = server.address()?.port ?? PORT;
         log(`HTTP 已监听 http://127.0.0.1:${servedPort()}（pid=${process.pid}）`);
         resolve();
@@ -860,5 +1365,7 @@ if (process.env.ENHANCE_SERVICE_AS_LIB !== '1') {
 
 export {
   enhance, cleanResult, stripWrappingQuotes, stripMetaLines, resolveModel,
-  buildChannels, readZcodeChannel, readFallbackChannel, originAllowed, readToken,
+  buildChannels, readZcodeChannels, readFallbackChannel, orderChannelsForModel,
+  originAllowed, readToken, validateEnhancement, lengthBand, resolveMode, promptFilesFor,
+  clearResultCache, cacheKeyOf,
 };

@@ -165,6 +165,39 @@ def _report_model_anchor(recent: list[dict]) -> None:
     print("  → 锚点通常在 chat toolbar（composer 的兄弟节点），确认 modelScope 的向上查找范围")
 
 
+def _report_server_records(events: list[dict]) -> None:
+    """汇总服务端写入的记录（有 `kind`、没有 `stage`/`session`）。
+
+    为什么不能靠会话过滤：这些记录不带 session，按 session 划分时会被整批滤掉，
+    而「点了按钮但输入框没变」的答案恰恰在这里 —— 服务端判定结果不合格，
+    主动退回原文（`success:true` + `improved:false`）。早先它们只存在于日志里，
+    在结论区一条都看不到，排查时永远缺这一环。
+    """
+    records = [ev for ev in events if ev.get("kind") and not ev.get("stage")]
+    if not records:
+        return
+    counts: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    for ev in records:
+        kind = str(ev.get("kind"))
+        counts[kind] = counts.get(kind, 0) + 1
+        for reason in ev.get("reasons") or []:
+            # 只留判定名（去掉「校验未过：」前缀与具体细节），便于看趋势
+            name = str(reason).split("：")[-1].split(":")[0].strip()
+            reasons[name] = reasons.get(name, 0) + 1
+    summary = "、".join(f"{k}×{v}" for k, v in sorted(counts.items()))
+    print(f"服务端记录（全量累计，无 session，不按本次启动过滤）：{summary}")
+    if reasons:
+        top = sorted(reasons.items(), key=lambda kv: -kv[1])
+        print("  判定原因：" + "、".join(f"{k}×{v}" for k, v in top[:6]))
+    last = records[-1]
+    print(f"  最近一次：{json.dumps({k: v for k, v in last.items() if k != 'ts'}, ensure_ascii=False)[:200]}")
+    if counts.get("enhance-fallback"):
+        print("  → 这些是「点了按钮但草稿没变」：服务端校验判定结果不合格，主动退回原文。")
+        print("     草稿本身够清楚时属正常；频率高则是校验规则误判（见 validateEnhancement）。")
+    print()
+
+
 def main() -> int:
     force_utf8()
     parser = argparse.ArgumentParser()
@@ -211,8 +244,13 @@ def main() -> int:
     # 打印"最后 40 条"而不是"最早 40 条"：日志到 5MB 上限后最早的那批是几天前的，
     # 而下面要判断的是本次启动，打印旧会话内容会跟结论打架（实测很容易看串）。
     for ev in events[-40:]:
-        stage = ev.get("stage")
-        detail = {k: v for k, v in ev.items() if k not in ("stage", "ts", "clientTs", "url", "session")}
+        # 服务端记录没有 stage，用 kind 兜底；否则这里会打出 "None"，
+        # 与下面的「服务端记录」汇总重复且更难看懂。
+        stage = ev.get("stage") or ev.get("kind") or "?"
+        detail = {k: v for k, v in ev.items()
+                  if k not in ("stage", "kind", "ts", "clientTs", "url", "session")}
+        if ev.get("kind"):
+            detail = {"kind": ev["kind"], **detail}
         print(f"  - {stage}  {json.dumps(detail, ensure_ascii=False)}")
 
     # 只认「本次启动」的事件：上次运行成功过的 attached 不能证明这次按钮挂上了，
@@ -230,6 +268,10 @@ def main() -> int:
         print("（信标里没有 session 字段：注入脚本是旧版本，按 url 划分会话）")
     stages = {ev.get("stage") for ev in recent}
     print()
+
+    # 服务端自己写的记录（kind 而非 stage）没有 session / url，按上面的会话过滤
+    # 一条都进不来。而「点了按钮但内容没变」正是要靠它解释的，所以单独汇总。
+    _report_server_records(events)
 
     # 写回结果单独说清楚：这是「增强成功但回填失败」这类问题的唯一线索
     last_write = next(

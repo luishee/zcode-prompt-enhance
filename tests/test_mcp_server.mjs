@@ -179,7 +179,11 @@ check('无 Origin（curl / PowerShell）放行', mod.originAllowed(undefined) ==
 {
   mock.content = '正常结果';
   const r = await mod.enhance('正常草稿');
-  check('成功响应带上 maxLength（前端不再硬编码 800）', r.success === true && r.maxLength === 800);
+  // 0.1.8 起上限按草稿长度与档位动态算（lengthBand），不再是固定 800。
+  // 这里只断言「带上了正整数上限」，具体数值由 test_validate.mjs 的 lengthBand 用例钉住。
+  check('成功响应带上 maxLength（前端不再硬编码 800）',
+    r.success === true && Number.isInteger(r.maxLength) && r.maxLength > 0,
+    `maxLength=${r.maxLength}`);
 }
 
 // ------------------------------------------------------------------ 3. enhance 契约
@@ -203,7 +207,11 @@ mock.seen.length = 0;
   const joined = (call?.body?.messages ?? []).map((m) => m.content).join('\n');
   check('用户文本真的进了 payload', joined.includes('目标文本XYZ'), joined.slice(0, 80));
   check('{input} 占位符被替换', !joined.includes('{input}'));
-  check('temperature 稳（0.3）', call?.body?.temperature === 0.3);
+  // 改写任务要稳：温度必须低（0.1.8 起定为 0.2，早先是 0.3）。
+  // 断言「低且确定」而不是钉死某个值，避免每次调参都要改测试。
+  check('temperature 稳（≤0.3）',
+    typeof call?.body?.temperature === 'number' && call.body.temperature <= 0.3,
+    `temperature=${call?.body?.temperature}`);
 }
 {
   mock.status = 500;
@@ -236,9 +244,13 @@ mock.seen.length = 0;
     r.text === '请解释这段代码' && r.removedMetaLines === 1, JSON.stringify(r).slice(0, 140));
 }
 {
-  mock.content = '啊'.repeat(900);
+  // 0.1.8 起 professional 短草稿上限是 1200（实测 5/5 落在 624~1133 字），
+  // 所以 900 字不再算超长。这里用 1500 字确保越过上限，验证的是「标记」而不是具体阈值。
+  mock.content = '啊'.repeat(1500);
   const r = await mod.enhance('草稿');
-  check('超 800 字打标记', r.success === true && r.overLength === true);
+  check('超出档位上限打 overLength 标记',
+    r.success === true && r.overLength === true,
+    `overLength=${r.overLength} maxLength=${r.maxLength} len=${(r.text || '').length}`);
 }
 
 // ---- finish_reason='length'（max_tokens 截断）不能当成功 ----

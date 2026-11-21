@@ -31,8 +31,14 @@
     submitCount += 1;
   });
 
+  /**
+   * 用 `el.click()` 而不是 `dispatchEvent`：
+   * dispatchEvent 会绕过 disabled 语义（disabled 的按钮照样收到事件），
+   * 于是「加载中再点一次 = 取消」这类缺陷会假通过 —— 实测踩过。
+   * el.click() 才是用户真实点击的等价物，被 disabled 拦掉时不会派发。
+   */
   async function click(el) {
-    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    el.click();
     await wait(30);
   }
 
@@ -260,16 +266,58 @@
     check('改动后的内容没有被覆盖', text(editor) === '用户又改了', text(editor));
 
     // ---- 11. 请求途中取消：不写回、不覆盖草稿、状态显示已取消 ----
+    // 关键前提：加载中按钮**不能** disabled，否则这次点击根本不会派发，
+    // 取消路径看起来"通过"其实从未被执行（早先就是这么假通过的）。
     window.__mockDelay = 200;
     setDraft('取消测试');
     await click(button);
-    check('增强中按钮进入禁用态', button.disabled === true);
-    await click(button); // 再点一次 = 取消
+    check('增强中按钮仍可点击（否则取消入口是死的）', button.disabled === false,
+      `disabled=${button.disabled} aria-busy=${button.getAttribute('aria-busy')}`);
+    check('增强中用 aria-busy 表达状态', button.getAttribute('aria-busy') === 'true',
+      `aria-busy=${button.getAttribute('aria-busy')}`);
+    await click(button); // 再点一次 = 取消（真实点击语义）
     await wait(400); // 等 mock 的延迟彻底过去，确认迟到的结果不会写回
     check('取消后草稿保持原样', text(editor) === '取消测试', text(editor));
     check('取消后状态显示已取消', text(status()).includes('已取消'), text(status()));
-    check('取消后按钮恢复可点', button.disabled === false);
+    check('取消后按钮恢复可点', button.disabled === false && button.getAttribute('aria-busy') === 'false');
     window.__mockDelay = 0;
+
+    // ---- 12. 请求途中用户继续输入：绝不能覆盖新内容 ----
+    // 这是数据丢失场景：返回的 result 属于旧草稿，写回去会删掉用户刚敲的字。
+    window.__mockDelay = 500;
+    setDraft('旧草稿');
+    button.click();
+    await wait(120);
+    setDraft('用户在等待期间新写的内容');
+    await wait(700);
+    check('请求途中输入的新内容未被覆盖',
+      text(editor) === '用户在等待期间新写的内容', text(editor));
+    check('请求途中改动 → 状态说明未写入', text(status()).includes('草稿已被修改'), text(status()));
+    window.__mockDelay = 0;
+
+    // ---- 13. improved:false（服务端判定不必改）不能显示成「已增强」 ----
+    setDraft('帮我写个函数');
+    window.__calls.length = 0;
+    const realJson = window.__mockPayload;
+    // 用线上真实回包形状：两次尝试都带判定原因，且原因重复出现
+    window.__mockPayload = (draft) => ({
+      success: true, text: draft, original: draft, model: '', improved: false,
+      channel: '', overLength: false,
+      attempts: [
+        { channel: 'zcode', code: 'validation', error: '校验未过：asks_user, placeholder_left' },
+        { channel: 'zcode', code: 'validation', error: '重试仍未过：asks_user, placeholder_left' },
+      ],
+    });
+    await click(button);
+    await wait(80);
+    check('improved:false → 不显示「已增强」', !text(status()).startsWith('已增强'), text(status()));
+    check('improved:false → 明确告知未做改动', text(status()).includes('未做改动'), text(status()));
+    check('improved:false → 说出判定原因（不是只报未改动）',
+      text(status()).includes('追问材料') || text(status()).includes('占位符'), text(status()));
+    check('improved:false → 原因去重（同一原因不重复两次）',
+      (text(status()).match(/追问材料/g) || []).length <= 1, text(status()));
+    check('improved:false → 不出现无效的「还原原文」', !!revertBtn() && revertBtn().hidden === true);
+    window.__mockPayload = realJson;
 
     finish();
   }

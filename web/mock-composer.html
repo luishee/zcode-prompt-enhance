@@ -87,15 +87,19 @@
         ok: true,
         status: 200,
         text: () => Promise.resolve(''),
-        json: () => Promise.resolve({
-          success: true,
-          text: '【增强】' + (body && body.text ? body.text : ''),
-          original: body && body.text,
-          model: body && body.model,
-          channel: 'zcode',
-          removedMetaLines: 0,
-          overLength: false,
-        }),
+        json: () => Promise.resolve(
+          // __mockPayload 允许单个用例覆盖返回形状（例如 improved:false），
+          // 用来验证前端对不同结果的分支处理。
+          (window.__mockPayload || ((draft) => ({
+            success: true,
+            text: '【增强】' + (draft || ''),
+            original: draft,
+            model: body && body.model,
+            channel: 'zcode',
+            removedMetaLines: 0,
+            overLength: false,
+          })))(body && body.text)
+        ),
       });
       const signal = init && init.signal;
       const abortError = () => Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });

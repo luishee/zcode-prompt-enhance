@@ -44,6 +44,11 @@
     // 实测「再点一次」只会越改越长（34→298→707 字），不能承诺收敛。
     overLength: (max) => `结果超过 ${max || 800} 字，建议手动精简后再用`,
     writeBackFailed: '已生成增强结果，但写回输入框失败（编辑器结构可能已变）',
+    // 服务端判定「这份草稿已经够清楚，改不如不改」：success:true + improved:false，
+    // text 就是原文。不能显示成「已增强」—— 用户会以为功能坏了。
+    notImproved: '草稿已足够清晰，未做改动',
+    // 请求期间用户改了草稿：宁可放弃这次结果，也不能覆盖用户刚写的内容。
+    draftChanged: '增强期间草稿已被修改，本次结果未写入',
   };
 
   const SEL = {
@@ -393,6 +398,9 @@
 }
 .zce-btn:hover:not(:disabled) { background: color-mix(in srgb, currentColor 8%, transparent); }
 .zce-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* 「增强中」不能靠 disabled：disabled 会吞掉点击，而第二次点击正是取消入口。
+   视觉上仍然弱化，但保留可点击 + 可聚焦。 */
+.zce-btn[aria-busy="true"] { opacity: .75; }
 .zce-btn[data-active="true"] { color: var(--brand, #2f6fed); border-color: currentColor; }
 .zce-icon { font-size: 12px; }
 .zce-spin {
@@ -473,13 +481,20 @@
 
   function render(st) {
     if (!st.button) return;
-    if (st.button.disabled !== st.loading) st.button.disabled = st.loading;
+    // 增强中**不能**把按钮置为 disabled：disabled 的点击根本不会派发到 handler，
+    // 而「再点一次」正是取消入口（tooltip 也是这么写的）。早先这里直接
+    // `button.disabled = st.loading`，于是鼠标取消这条路一直是死的，
+    // 只能靠 Ctrl+Shift+E / Esc —— 用户按提示再点却毫无反应。
+    // 现在改用 aria-busy 表达状态：读屏可见、样式可弱化，点击照常派发。
+    const busy = st.loading ? 'true' : 'false';
+    if (st.button.getAttribute('aria-busy') !== busy) st.button.setAttribute('aria-busy', busy);
+    if (st.button.disabled) st.button.disabled = false;
     const active = st.loading ? 'true' : 'false';
     if (st.button.dataset.active !== active) st.button.dataset.active = active;
 
     renderButton(st);
 
-    const tip = st.loading ? '再次点击可取消当前这次增强' : `${TEXT.idle}（Ctrl+Shift+E）`;
+    const tip = st.loading ? '再次点击可取消当前这次增强（Esc）' : `${TEXT.idle}（Ctrl+Shift+E）`;
     if (st.button.title !== tip) st.button.title = tip;
 
     if (st.revert) {
@@ -494,6 +509,44 @@
     const headers = { 'Content-Type': 'application/json' };
     if (TOKEN) headers['X-ZCE-Token'] = TOKEN;
     return headers;
+  }
+
+  // 服务端校验原因（`tech_added:numpy` / `asks_user` …）→ 给用户看的一句话。
+  // 只翻译已知项，未知原因原样透出：宁可显示英文码，也不要静默吞掉线索。
+  const REASON_TEXT = {
+    asks_user: '结果会向你追问材料',
+    preparatory_step: '结果加了多余的前置步骤',
+    placeholder_left: '结果留了待填占位符',
+    code_block_changed: '结果改动了代码块',
+    empty: '模型返回空结果',
+  };
+
+  /**
+   * 从 attempts[].error 里抽出判定原因，去重后拼成短句。
+   *
+   * 服务端的 error 形如「校验未过：asks_user, placeholder_left」或
+   * 「重试仍未过：tech_added:numpy」，同一原因会在两次尝试里各出现一次，
+   * 所以要去重；取不到就返回空串（调用方只显示基础文案）。
+   */
+  function summarizeReasons(attempts) {
+    const seen = [];
+    for (const attempt of Array.isArray(attempts) ? attempts : []) {
+      const raw = String(attempt?.error || '');
+      // 去掉「校验未过：」「重试仍未过：」这类前缀，只留原因本身
+      const tail = raw.includes('：') ? raw.slice(raw.indexOf('：') + 1) : raw;
+      for (const token of tail.split(/[,，、]/)) {
+        const key = token.trim().split(':')[0];
+        if (!key || seen.includes(key)) continue;
+        seen.push(key);
+      }
+    }
+    const human = seen.map((k) => {
+      if (REASON_TEXT[k]) return REASON_TEXT[k];
+      // tech_added:numpy → 「结果自行加了 numpy」
+      if (k === 'tech_added') return '结果自行加了未点名的技术';
+      return k;
+    });
+    return human.slice(0, 2).join('、');
   }
 
   /**
@@ -564,6 +617,26 @@
         // 失败：保留草稿，只提示原因
         const reason = (data && (data.error || data.code)) || `HTTP ${resp.status}`;
         setStatus(st, TEXT.failedWith(reason), 'error');
+        return;
+      }
+
+      // 服务端在「结果不合格」时会主动退回原文（success:true + improved:false），
+      // 那不是增强成功。必须单独提示：否则用户看到的是「已增强」但草稿一字未变，
+      // 还会多出一个「还原原文」按钮（点了写回同样内容，完全是死的）。
+      //
+      // 只报「未做改动」还不够：用户不知道**为什么**，会当成功能坏了。
+      // 服务端把判定原因放在 attempts[].error 里，这里抽出来给人看。
+      if (data.improved === false) {
+        const why = summarizeReasons(data.attempts);
+        setStatus(st, why ? `${TEXT.notImproved}（${why}）` : TEXT.notImproved, 'warn');
+        return;
+      }
+
+      // 请求飞行期间用户可能继续输入。此时按旧草稿覆盖，等于把刚写的内容删掉 ——
+      // 这是数据丢失，比「不增强」严重得多。所以写回前必须再读一次当前草稿。
+      if (normalize(readDraft(editor)) !== normalize(draft)) {
+        beacon('write-skipped', { reason: 'draft-changed', gotLen: normalize(readDraft(editor)).length });
+        setStatus(st, TEXT.draftChanged, 'warn');
         return;
       }
 

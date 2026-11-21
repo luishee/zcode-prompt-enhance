@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -25,13 +26,37 @@ from zce_common import HTML_REL, INJECT_REL, SCRIPT_TAG, force_utf8  # noqa: E40
 ALLOWED_DIFF = {HTML_REL}
 
 
+def _state_defaults() -> tuple[str | None, str | None]:
+    """从 patch-state.json 读默认路径：基线备份 + 当前安装的 asar。
+
+    为什么要默认值：这两个路径每次都已记录在状态文件里，强制手输只会让人
+    复制粘贴，或干脆不跑这项校验（原先直接跑会报「缺少 --original/--patched」）。
+    显式参数仍然优先，状态文件只是兜底。
+    """
+    try:
+        state = json.loads((Path(__file__).resolve().parent.parent / "patch-state.json")
+                           .read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    backup = state.get("backup")
+    asar = state.get("asar")
+    return (backup if isinstance(backup, str) else None,
+            asar if isinstance(asar, str) else None)
+
+
 def main() -> int:
     force_utf8()
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--original", required=True)
-    parser.add_argument("--patched", required=True)
+    state_original, state_patched = _state_defaults()
+    parser = argparse.ArgumentParser(
+        description="逐文件逐字节比对补丁后的 asar 与基线（默认取 patch-state.json 记录）")
+    parser.add_argument("--original", default=state_original,
+                        help="原始（基线备份）asar；默认取 patch-state.json 的 backup")
+    parser.add_argument("--patched", default=state_patched,
+                        help="已打补丁的 asar；默认取 patch-state.json 的 asar")
     parser.add_argument("--inject-rel", default=INJECT_REL)
     args = parser.parse_args()
+    if not args.original or not args.patched:
+        parser.error("缺少 --original/--patched，且 patch-state.json 里没有可用记录")
     inject_rel = args.inject_rel.replace("\\", "/")
     allowed = ALLOWED_DIFF | {inject_rel}
 

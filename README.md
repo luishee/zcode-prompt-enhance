@@ -499,7 +499,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8770/api/enhance -Method Post `
 | `python tools/patch_zcode.py --full-verify apply` | 强制在写完后做全量逐字节比对（刷新时默认只校验注入的两个条目） |
 | `python tools/patch_zcode.py --force apply` | 允许"没有基线备份时仍删除 integrity 字段"（默认会拦下并说明原因） |
 | `python tools/patch_zcode.py --dry-run apply` | 演练：写到 `build/app.asar.dryrun`，不动原文件、不写状态、不生成令牌 |
-| `python tools/verify_patch.py --original <备份> --patched <asar>` | 全量逐字节校验（实测约 3.18 万文件） |
+| `python tools/verify_patch.py` | 全量逐字节校验（实测约 3.18 万文件）。参数默认取 `patch-state.json` 记录的基线与当前包，无需手输 |
 | `python tools/check_beacon.py [--wait 30]` | 按钮没出现时，读信标定位卡在哪一步（只读插件格式、只统计本次启动） |
 | `python tools/check_beacon.py --purge-legacy` | 物理删除日志里 Python 时代的旧格式行（只留插件格式），再照常分析 |
 | `python tools/run_dom_test.py` | 无头浏览器跑注入脚本的 36 项 DOM 断言 |
@@ -680,7 +680,9 @@ python tools/check_beacon.py --purge-legacy
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | `提示词增强失败：Failed to fetch · 增强服务未响应…` | 插件没跑 / 端口没监听 | 查 `mcp-server.mjs` 进程与 `/api/health`；确认插件已启用；重启 ZCode |
-| 同上，且刚重启过 ZCode | 旧实例还占着 8770，新实例在退避重试（最长约 13 分钟） | 等一会儿再试；或结束占端口的 node 进程。`enhance_service_status` 工具会报 `retrying: true` |
+| 同上，且刚重启过 ZCode | 旧实例还占着 8770，新实例在退避重试（前 13 分钟密集，之后转 60~180s 低频重试，不会放弃） | 等一会儿即可自愈；或结束占端口的 node 进程。`enhance_service_status` 会报 `retrying: true`；`giveUp: "EADDRINUSE"` 表示已转入低频重试 |
+| `草稿已足够清晰，未做改动` | 服务端校验判定结果不合格（例如会向用户索要材料），主动退回原文并报 `improved:false` | 不是故障：草稿本身已够明确。频繁出现就看信标 `enhance-fallback` 的 `reasons` |
+| `增强期间草稿已被修改，本次结果未写入` | 请求飞行期间用户继续输入，为避免覆盖新内容而放弃写回 | 正常保护行为，重新点一次即可 |
 | `truncated` | 上游输出被 `max_tokens` 截断 | 精简草稿后重试；这是刻意不写回半截结果 |
 | `invalid_input` | `text` 不是字符串（前端 bug） | 检查调用方是否把对象/数字当草稿传了 |
 | 换模型后增强仍用旧模型 | 模型锚点失配（锚点在 chat toolbar，不在 composer 内） | 跑 `check_beacon.py`，它会指出三个锚点各自的命中情况 |
@@ -769,7 +771,8 @@ python tests/test_plugin_manifest.py
 # purge 只删旧格式且幂等、模型锚点四分支判定（21 项）
 python tests/test_check_beacon.py
 
-# 全量逐字节校验（需先拿到原始备份）
+# 全量逐字节校验（默认用 patch-state.json 里的基线与当前包；也可显式指定）
+python tools/verify_patch.py
 python tools/verify_patch.py --original "<备份>" --patched "D:\Program Files\ZCode\resources\app.asar"
 ```
 

@@ -210,6 +210,30 @@ def main() -> int:
         check("model-pick 未命中 → 报 ✗ 而不是静默",
               "✗" in pick_miss and "点击时" in pick_miss, pick_miss.strip()[:80])
 
+        # ---- 服务端记录（有 kind、无 session）必须能在结论区看见 ----
+        # 回归点：这些记录不带 session，按会话过滤会被整批滤掉，而「点了按钮但草稿没变」
+        # 的答案就在这里（服务端 improved:false 退回原文）。早先结论区一条都没有。
+        server_records = [
+            {"kind": "enhance-fallback", "inputLen": 10,
+             "reasons": ["校验未过：asks_user", "重试仍未过：asks_user"]},
+            {"kind": "enhance-fallback", "inputLen": 16,
+             "reasons": ["校验未过：tech_added:numpy"]},
+        ]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            check_beacon._report_server_records(server_records)
+        out = buf.getvalue()
+        check("服务端记录被汇总（数量正确）", "enhance-fallback×2" in out, out.strip()[:100])
+        check("服务端记录列出判定原因",
+              "asks_user" in out and "tech_added" in out, out.strip()[:120])
+        check("服务端记录解释「草稿没变」",
+              "草稿没变" in out or "退回原文" in out, out.strip()[-90:])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            check_beacon._report_server_records([{"stage": "boot", "session": "s1"}])
+        check("没有服务端记录时不输出噪声", buf.getvalue().strip() == "", buf.getvalue()[:60])
+
     print(f"\n{TOTAL - FAILED}/{TOTAL} 通过")
     return 1 if FAILED else 0
 
